@@ -11,7 +11,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface ShaderTableViewController : UITableViewController
 
-@property (nonatomic, copy) NSString *profileName;
+// profileName: which profile to scan for shaders (e.g. default)
+@property (nonatomic, copy, nullable) NSString *profileName;
 
 @end
 
