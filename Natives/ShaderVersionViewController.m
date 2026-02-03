@@ -1,5 +1,6 @@
 #import "ShaderVersionViewController.h"
 #import "installer/modpack/ModrinthAPI.h"
+#import "ModVersion.h"
 #import "ModVersionTableViewCell.h"
 
 @interface ShaderVersionViewController () <UITableViewDataSource, UITableViewDelegate>
@@ -23,9 +24,10 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    
     self.title = self.shaderItem.displayName;
     self.view.backgroundColor = [UIColor systemBackgroundColor];
-
+    
     [self setupFilterControls];
     [self setupTableView];
     [self setupActivityIndicator];
@@ -34,7 +36,8 @@
 
 - (void)fetchVersions {
     [self.activityIndicator startAnimating];
-    [[ModrinthAPI sharedInstance] getVersionsForModWithID:self.shaderItem.onlineID completion:^(NSArray<ModVersion *> *versions, NSError *error) {
+    [[ModrinthAPI sharedInstance] getVersionsForModWithID:self.shaderItem.onlineID
+                                              completion:^(NSArray<ModVersion *> *versions, NSError *error) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.activityIndicator stopAnimating];
             self.allVersions = versions;
@@ -43,14 +46,17 @@
     }];
 }
 
-#pragma mark - TableView
+#pragma mark - UITableViewDataSource
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return self.filteredVersions.count;
 }
 
-- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
-    ModVersionTableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"ModVersionCell" forIndexPath:indexPath];
+- (UITableViewCell *)tableView:(UITableView *)tableView
+         cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    ModVersionTableViewCell *cell =
+    [tableView dequeueReusableCellWithIdentifier:@"ModVersionCell"
+                                    forIndexPath:indexPath];
     [cell configureWithVersion:self.filteredVersions[indexPath.row]];
     return cell;
 }
