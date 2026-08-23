@@ -14,6 +14,7 @@ import java.nio.IntBuffer;
 
 import javax.annotation.Nullable;
 
+import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.*;
 import org.lwjgl.system.macosx.*;
 import org.lwjgl.system.MemoryStack;
@@ -56,6 +57,17 @@ public class SDLVideo {
     public static final int SDL_WINDOWPOS_UNDEFINED       = 0x1FFF0000;
     public static final int SDL_WINDOWPOS_CENTERED_MASK   = 0x2FFF0000;
     public static final int SDL_WINDOWPOS_CENTERED        = 0x2FFF0000;
+
+    // --- Display / monitor ---
+    /** Synthetic primary display id. SDL_DisplayID is an unsigned 32-bit handle; we mirror the
+     *  GLFW stub whose glfwGetPrimaryMonitor() returns a non-null sentinel (1L). */
+    public static final int SDL_DISPLAY_ID_PRIMARY = 1;
+
+    public static final int SDL_ORIENTATION_UNKNOWN   = 0;
+    public static final int SDL_ORIENTATION_LANDSCAPE = 1;
+
+    /** No real pixel format is reported for the synthetic iOS display. */
+    public static final int SDL_PIXELFORMAT_UNKNOWN = 0;
 
     /** GL attributes (subset needed by MC). Values match SDL3 gl.h constants. */
     public static final int SDL_GL_RED_SIZE           = 0;
@@ -301,8 +313,177 @@ public class SDLVideo {
     }
 
     // ------------------------------------------------------------------
+    // Display / monitor enumeration
+    // ------------------------------------------------------------------
+    //
+    // Minecraft 26.3-snapshot-4+ resolves monitors through the SDL3 display API
+    // (com.mojang.blaze3d.platform.MonitorManager). These stubs collapse every
+    // physical display into a single synthetic "Primary Monitor" whose bounds,
+    // work area, content scale and modes reuse the exact values the GLFW stub
+    // already reports (window pixel size + UIScreen scale + ProMotion refresh).
+    //
+    // Root cause of the startup crash: SDL_GetDisplays() did not exist on the
+    // stub, so MonitorManager.<init> threw NoSuchMethodError before any UI was
+    // created. Every signature below matches the shipped lwjgl-sdl 3.4.1 jar.
+
+    /** Enumerate displays. Official binding returns an IntBuffer of SDL_DisplayID; MC expects
+     *  the descriptor {@code ()Ljava/nio/IntBuffer;}. We report exactly one display. */
+    @Nullable
+    @NativeType("SDL_DisplayID *")
+    public static IntBuffer SDL_GetDisplays() {
+        IntBuffer buffer = memAllocInt(1);
+        buffer.put(0, SDL_DISPLAY_ID_PRIMARY);
+        return buffer; // position 0, limit/capacity 1 -> MC iterates remaining() == 1
+    }
+
+    @NativeType("SDL_DisplayID")
+    public static int SDL_GetPrimaryDisplay() {
+        return SDL_DISPLAY_ID_PRIMARY;
+    }
+
+    /** No additional display property set (HDR/edid/...): return an empty properties id. */
+    @NativeType("SDL_PropertiesID")
+    public static int SDL_GetDisplayProperties(@NativeType("SDL_DisplayID") int displayID) {
+        return 0;
+    }
+
+    @Nullable
+    @NativeType("const char *")
+    public static String SDL_GetDisplayName(@NativeType("SDL_DisplayID") int displayID) {
+        return "Primary Monitor";
+    }
+
+    public static boolean SDL_GetDisplayBounds(@NativeType("SDL_DisplayID") int displayID, SDL_Rect rect) {
+        if (rect != null) {
+            long[] px = parsedPixelSize();
+            rect.set(0, 0, (int) px[0], (int) px[1]); // full physical screen, no notch inset on a single monitor
+        }
+        return true;
+    }
+
+    public static boolean SDL_GetDisplayUsableBounds(@NativeType("SDL_DisplayID") int displayID, SDL_Rect rect) {
+        if (rect != null) {
+            long[] px = parsedPixelSize();
+            rect.set(0, 0, (int) px[0], (int) px[1]);
+        }
+        return true;
+    }
+
+    @NativeType("SDL_DisplayOrientation")
+    public static int SDL_GetNaturalDisplayOrientation(@NativeType("SDL_DisplayID") int displayID) {
+        return SDL_ORIENTATION_LANDSCAPE;
+    }
+
+    @NativeType("SDL_DisplayOrientation")
+    public static int SDL_GetCurrentDisplayOrientation(@NativeType("SDL_DisplayID") int displayID) {
+        return SDL_ORIENTATION_LANDSCAPE;
+    }
+
+    public static float SDL_GetDisplayContentScale(@NativeType("SDL_DisplayID") int displayID) {
+        return pixelScale();
+    }
+
+    @Nullable
+    public static SDL_DisplayMode SDL_GetDesktopDisplayMode(@NativeType("SDL_DisplayID") int displayID) {
+        long[] px = parsedPixelSize();
+        return newDisplayMode((int) px[0], (int) px[1], parseRefreshRate());
+    }
+
+    @Nullable
+    public static SDL_DisplayMode SDL_GetCurrentDisplayMode(@NativeType("SDL_DisplayID") int displayID) {
+        long[] px = parsedPixelSize();
+        return newDisplayMode((int) px[0], (int) px[1], parseRefreshRate());
+    }
+
+    @Nullable
+    public static PointerBuffer SDL_GetFullscreenDisplayModes(@NativeType("SDL_DisplayID") int displayID) {
+        long[] px = parsedPixelSize();
+        PointerBuffer buffer = PointerBuffer.allocateDirect(1);
+        buffer.put(newDisplayMode((int) px[0], (int) px[1], parseRefreshRate()).address());
+        buffer.flip();
+        return buffer;
+    }
+
+    public static boolean SDL_GetClosestFullscreenDisplayMode(@NativeType("SDL_DisplayID") int displayID, int w, int h,
+            float refresh_rate, @NativeType("bool") boolean include_high_density_modes, SDL_DisplayMode closest) {
+        if (closest != null) {
+            float rate = refresh_rate > 0.0f ? refresh_rate : parseRefreshRate();
+            fillDisplayMode(closest, w, h, rate);
+        }
+        return true;
+    }
+
+    @NativeType("SDL_DisplayID")
+    public static int SDL_GetDisplayForPoint(SDL_Point point) {
+        return SDL_DISPLAY_ID_PRIMARY;
+    }
+
+    @NativeType("SDL_DisplayID")
+    public static int SDL_GetDisplayForRect(SDL_Rect rect) {
+        return SDL_DISPLAY_ID_PRIMARY;
+    }
+
+    @NativeType("SDL_DisplayID")
+    public static int SDL_GetDisplayForWindow(@NativeType("SDL_Window *") long window) {
+        return SDL_DISPLAY_ID_PRIMARY;
+    }
+
+    public static float SDL_GetWindowDisplayScale(@NativeType("SDL_Window *") long window) {
+        return pixelScale();
+    }
+
+    /** Window fullscreen mode / position: no-ops; iOS owns the backing surface geometry. */
+    public static boolean SDL_SetWindowFullscreenMode(@NativeType("SDL_Window *") long window, @Nullable SDL_DisplayMode mode) {
+        return true;
+    }
+
+    @Nullable
+    public static SDL_DisplayMode SDL_GetWindowFullscreenMode(@NativeType("SDL_Window *") long window) {
+        return null; // windowed (no exclusive fullscreen on iOS)
+    }
+
+    public static boolean SDL_SetWindowPosition(@NativeType("SDL_Window *") long window, int x, int y) {
+        return true;
+    }
+
+    public static boolean SDL_GetWindowPosition(@NativeType("SDL_Window *") long window, @Nullable @NativeType("int *") IntBuffer x, @Nullable @NativeType("int *") IntBuffer y) {
+        if (x != null) x.put(0, 0);
+        if (y != null) y.put(0, 0);
+        return true;
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
+
+    private static float pixelScale() {
+        try {
+            return (float) Double.parseDouble(System.getProperty("UIScreen.mainScreen.scale", "1.0"));
+        } catch (Exception ignored) {
+            return 1.0f;
+        }
+    }
+
+    private static float parseRefreshRate() {
+        try {
+            return Float.parseFloat(System.getProperty("UIScreen.maximumFramesPerSecond", "60"));
+        } catch (Exception ignored) {
+            return 60.0f;
+        }
+    }
+
+    /** Fill an existing (caller-owned) SDL_DisplayMode with our synthetic desktop mode. */
+    private static void fillDisplayMode(SDL_DisplayMode mode, int w, int h, float refreshRate) {
+        int numerator = Math.max(1, Math.round(refreshRate));
+        mode.set(SDL_DISPLAY_ID_PRIMARY, SDL_PIXELFORMAT_UNKNOWN, w, h, pixelScale(), refreshRate, numerator, 1, 0L);
+    }
+
+    /** Allocate + populate a display mode; ownership transfers to the caller. */
+    private static SDL_DisplayMode newDisplayMode(int w, int h, float refreshRate) {
+        SDL_DisplayMode mode = SDL_DisplayMode.calloc();
+        fillDisplayMode(mode, w, h, refreshRate);
+        return mode;
+    }
 
     private static int[] parsedWindowSize() {
         String size = System.getProperty("glfw.windowSize", "1280x720");
