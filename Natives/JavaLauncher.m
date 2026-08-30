@@ -359,6 +359,25 @@ BOOL JVMUsedInProcess(void) {
     return gJvmUsedInProcess;
 }
 
+// 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
+//   "333" / "341" -> 原样使用
+//   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
+//
+// MC 26.3 起窗口与键盘系统从 GLFW 迁到 SDL3，只有 3.4.1 带真正的 SDL3 绑定
+// （lwjgl-sdl.jar 加载真实 libSDL3），因此 26.x 及以上必须选 341。
+static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersionId) {
+    if ([profileValue isEqualToString:@"333"] || [profileValue isEqualToString:@"341"]) {
+        return profileValue;
+    }
+    if (mcVersionId.length > 0) {
+        NSArray *parts = [mcVersionId componentsSeparatedByString:@"."];
+        if (parts.count >= 2 && [parts[0] intValue] >= 26) {
+            return @"341";
+        }
+    }
+    return @"333";
+}
+
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
@@ -1044,25 +1063,45 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     init_loadCustomJvmFlags(&margc, (const char **)margv);
     NSLog(@"[Init] Found JLI lib");
 
-    // 关键修复（26.2 启动崩溃）：单一 lwjgl.jar（对齐 Ynnyny 仓库）
-    // 之前 workspace 分裂为 lwjgl.jar 和 lwjgl33.jar，现对齐 Ynnyny 用单一合并 jar。
-    // 定制版 root lwjgl.jar（含 iOS 专用 LWJGL 补丁）已通过 JavaApp/Makefile 合并进 lwjgl.jar。
-    NSString *lwjglJar = [NSString stringWithFormat:@"%@/lwjgl.jar", librariesPath];
-    NSLog(@"[JavaLauncher] Using LWJGL jar at %@", lwjglJar);
+    // LWJGL 双版本：按 MC 版本选择 3.3.3 或 3.4.1（对齐 Ynnyny 仓库）
+    //
+    // 之前 workspace 用单一合并 lwjgl.jar；现按 LWJGL 版本拆分为
+    //   app/libs/lwjgl-333/lwjgl.jar 与 app/libs/lwjgl-341/lwjgl.jar，
+    // 由 ResolveLwjglVersion 在运行时选择其一。
+    //
+    // 两个 jar 在 JavaApp/Makefile 中均已合并定制版 root lwjgl.jar（含 iOS 专用
+    // LWJGL 补丁 + LWJGL2 兼容类 org/lwjgl/opengl/Display 等），因此老版本 MC
+    // （Java 8 / 1.12.2 及以下）不会因为换成 3.4.1 而失去 LWJGL2 API。
+    //
+    // MC 26.3 起窗口与输入从 GLFW 迁到 SDL3，必须使用 3.4.1 —— 它带真正的
+    // lwjgl-sdl.jar（加载真实 libSDL3），是 SDL3 输入注入的前提。
+    NSString *mcVersionId = [launchTarget isKindOfClass:NSString.class]
+        ? (NSString *)launchTarget
+        : PLProfiles.current.selectedProfile[@"lastVersionId"];
+    NSString *lwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"], mcVersionId);
+    NSLog(@"[JavaLauncher] Using LWJGL %@ (mcVersion=%@)", lwjglVersion, mcVersionId);
+    PUSH_MARGV_FORMAT(@"-Dpojav.lwjgl.version=%@", lwjglVersion);
 
-    // 校验目标 LWJGL jar 是否存在，避免静默崩溃
-    if (![fm fileExistsAtPath:lwjglJar]) {
+    NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
+    NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
+
+    // 校验目标 LWJGL 目录是否存在，避免静默崩溃。
+    // 注意：lwjgl-<ver>/ 是目录，不能用带 "/*" 的 classpath 条目做存在性判断。
+    BOOL lwjglDirIsDir = NO;
+    if (![fm fileExistsAtPath:lwjglDir isDirectory:&lwjglDirIsDir] || !lwjglDirIsDir) {
         UIKit_returnToSplitView();
-        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: %@", [lwjglJar lastPathComponent]]);
+        showDialog(localize(@"Error", nil), [NSString stringWithFormat:@"LWJGL jar missing: lwjgl-%@/lwjgl.jar", lwjglVersion]);
         return 1;
     }
+    NSString *lwjglJar = [NSString stringWithFormat:@"%@/*", lwjglDir];
 
     NSMutableString *classpathBuilder = [NSMutableString string];
     NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
     for (NSString *libFile in libFiles) {
-        // 精确排除合并后的 LWJGL jar，避免重复；保留其他以 lwjgl 开头的依赖 jar
-        if ([libFile hasSuffix:@".jar"] &&
-            ![libFile isEqualToString:@"lwjgl.jar"]) {
+        // 只收集 libs 下的 jar。lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，
+        // 不会被误收；版本化 LWJGL 由下方的 lwjglJar 单独追加。
+        if ([libFile hasSuffix:@".jar"]) {
             [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
         }
     }
@@ -1302,14 +1341,24 @@ int launchHeadlessJVM(NSString *mainClass, NSArray<NSString *> *args, int minJav
     }
 
     // classpath：bundle libs 下全部 jar（launcher.jar 含 ForgeProcessorRunner，gson 等也在其中）
+    // + 版本化 LWJGL 目录（lwjgl-333/ 或 lwjgl-341/）
     NSString *librariesPath = [NSString stringWithFormat:@"%@/libs", NSBundle.mainBundle.bundlePath];
     NSMutableString *classpathBuilder = [NSMutableString string];
     NSArray *libFiles = [fm contentsOfDirectoryAtPath:librariesPath error:nil];
     for (NSString *libFile in libFiles) {
+        // lwjgl-333/ 与 lwjgl-341/ 是目录，不以 .jar 结尾，不会被误收，
+        // 由下方按解析出的版本单独追加。
         if ([libFile hasSuffix:@".jar"]) {
             [classpathBuilder appendFormat:@"%@/%@:", librariesPath, libFile];
         }
     }
+    // headless JVM 用于 Forge/NeoForge 安装期的 processors，不运行 MC 本体，
+    // 但仍可能引用 LWJGL 类。这里按当前 profile 解析版本并追加对应目录。
+    NSString *headlessLwjglVersion = ResolveLwjglVersion(
+        [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"],
+        PLProfiles.current.selectedProfile[@"lastVersionId"]);
+    [classpathBuilder appendFormat:@"%@/lwjgl-%@/*:", librariesPath, headlessLwjglVersion];
+    NSLog(@"[JavaLauncher] headless JVM using LWJGL %@", headlessLwjglVersion);
     if (classpathBuilder.length > 0 && [classpathBuilder hasSuffix:@":"]) {
         [classpathBuilder deleteCharactersInRange:NSMakeRange(classpathBuilder.length - 1, 1)];
     }

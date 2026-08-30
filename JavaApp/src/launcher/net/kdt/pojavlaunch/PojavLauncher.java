@@ -163,6 +163,24 @@ public class PojavLauncher {
         String renderer = System.getenv("AMETHYST_RENDERER");
         if ("libMoltenVK.dylib".equals(renderer) || "vulkan".equals(renderer)) {
             System.setProperty("org.lwjgl.vulkan.libname", "MoltenVK");
+
+        // Sanity check: the LWJGL jar on the classpath must match the version the
+        // native launcher selected (AndroidLauncher sets -Dpojav.lwjgl.version and
+        // builds the classpath from libs/lwjgl-<version>/). Otherwise the wrong
+        // LWJGL set would be used, e.g. 3.3.3 when 3.4.1 (real SDL3 bindings) is
+        // required by MC 26.3+. org.lwjgl.Version comes from whichever lwjgl jar
+        // the classpath resolved first.
+        String activeLwjgl = System.getProperty("pojav.lwjgl.version");
+        if (activeLwjgl != null) {
+            try {
+                String versionStr = Class.forName("org.lwjgl.Version").getMethod("getVersion").invoke(null).toString();
+                System.out.println("[PojavLauncher] LWJGL selected by launcher: " + activeLwjgl
+                    + ", LWJGL on classpath: " + versionStr);
+            } catch (ReflectiveOperationException e) {
+                System.out.println("[PojavLauncher] LWJGL selected by launcher: " + activeLwjgl
+                    + ", failed to read org.lwjgl.Version: " + e);
+            }
+        }
         }
 
         // MC 26.2+ Graphics API 切换（OpenGL/Vulkan 游戏内图形后端选择）

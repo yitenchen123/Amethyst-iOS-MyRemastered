@@ -9,6 +9,11 @@ TARGETS := $(shell find $(SOURCEDIR) -mindepth 1 -maxdepth 1 -type d)
 TARGETS := $(TARGETS:$(SOURCEDIR)/%=$(OUTPUTDIR)/%.jar)
 
 # Add all jars to classpath and allow compiling with private API
+# 编译期 classpath 顺序说明：$(wildcard libs/*/*.jar) 按字典序展开，
+# libs/lwjgl < libs/lwjgl-333 < libs/lwjgl-341，因此老版 Amethyst 预编译 jar
+# （含 GLFW.mGLFWWindowWidth 等扩展 API 表面）会排在版本化集合之前。
+# 参考仓库显式列出各目录是为了固定该顺序，此处 wildcard 的字典序已等价满足。
+# 运行时只使用 lwjgl-333.jar / lwjgl-341.jar，不依赖 libs/lwjgl。
 JCFLAGS := -cp "$(subst $() $(),:,$(wildcard $(SOURCEDIR)/*/):$(wildcard libs/*/*.jar))" -XDignore.symbol.file
 
 all: $(TARGETS)
@@ -57,18 +62,36 @@ $(OUTPUTDIR)/launcher.jar: $(CLASSES) check_empty_classes
 	@cp -r $(SOURCEDIR)/launcher/META-INF $(basename $@)/ 2>/dev/null || true
 	@$(BOOTJDK)/jar -cf $@ -C $(basename $@) .
 
-$(OUTPUTDIR)/lwjgl.jar: $(CLASSES) check_empty_classes
+# 按 LWJGL 版本分别产出一个合并 jar（3.3.3 与 3.4.1）。
+#
+# 解压顺序即覆盖优先级（后者覆盖前者）：
+#   1) 仓库根 lwjgl.jar —— iOS 专用 LWJGL 补丁层，同时提供 LWJGL2 兼容类
+#      （org/lwjgl/opengl/Display、org/lwjgl/input/Keyboard、LWJGLException 等），
+#      老版本 MC（Java 8 / 1.12.2 及以下）依赖这些类，必须作为基底保留。
+#   2) libs/lwjgl-<ver>/*.jar —— 版本化的 LWJGL3。341 集合含真正的
+#      lwjgl-sdl.jar（加载真实 libSDL3），是 SDL3 输入注入的前提。
+#      放在基底之后，以便版本化的 LWJGL3 核心类（GLFW / MemoryUtil / SDL 等）
+#      覆盖根 jar 中的同名旧类。
+#   3) build/lwjgl/ —— Amethyst overlay（GLFW.java 等带 iOS 桥接的改写类），
+#      必须最后覆盖。
+$(OUTPUTDIR)/lwjgl-%.jar: $(CLASSES) check_empty_classes
 	@set -e
 	@echo "Creating $@"
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib
-	@cd $(OUTPUTDIR)/lwjgl_lib && find ../../libs/lwjgl -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
-	@cd $(OUTPUTDIR)/lwjgl_lib && $(BOOTJDK)/jar -xf "../../../lwjgl.jar" && rm -rf META-INF
-	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib/com/apple/ios/audio
-	@cp -R $(OUTPUTDIR)/launcher/com/apple/ios/audio/*.class $(OUTPUTDIR)/lwjgl_lib/com/apple/ios/audio/
-	@mkdir -p $(OUTPUTDIR)/lwjgl_lib/META-INF/services
-	@cp $(SOURCEDIR)/launcher/META-INF/services/javax.sound.sampled.spi.MixerProvider $(OUTPUTDIR)/lwjgl_lib/META-INF/services/
-	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib .
+	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*
+	@cd $(OUTPUTDIR)/lwjgl_lib_$* && $(BOOTJDK)/jar -xf "../../../lwjgl.jar" && rm -rf META-INF
+	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find ../../libs/lwjgl-$* -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
+	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib_$*/
+	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio
+	@cp -R $(OUTPUTDIR)/launcher/com/apple/ios/audio/*.class $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio/
+	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services
+	@cp $(SOURCEDIR)/launcher/META-INF/services/javax.sound.sampled.spi.MixerProvider $(OUTPUTDIR)/lwjgl_lib_$*/META-INF/services/
+	@$(BOOTJDK)/jar -cf $@ -C $(OUTPUTDIR)/lwjgl_lib_$* .
+
+# lwjgl.jar 仅作占位：all 目标因 src/lwjgl 是源码目录而列出它，但运行时使用
+# lwjgl-333.jar / lwjgl-341.jar。build/lwjgl.jar 不得进入 app 的 libs 目录，
+# 否则会被 classpath 中的 libs/* 与版本化 jar 一并加载，造成同名类冲突。
+$(OUTPUTDIR)/lwjgl.jar: $(OUTPUTDIR)/lwjgl-333.jar $(OUTPUTDIR)/lwjgl-341.jar
+	@echo "Skipping $@ (lwjgl-333.jar / lwjgl-341.jar are used instead)"
 
 $(OUTPUTDIR)/patchjna_agent.jar: $(CLASSES)
 	@set -e
