@@ -173,7 +173,7 @@ public class PojavLauncher {
         // "liblibMoltenVK.dylib.dylib" 导致 UnsatisfiedLinkError。
         String renderer = System.getenv("AMETHYST_RENDERER");
         if ("libMoltenVK.dylib".equals(renderer) || "vulkan".equals(renderer)) {
-            System.setProperty("org.lwjgl.vulkan.libname", "MoltenVK");
+            System.setProperty("org.lwjgl.vulkan.libname", "libMoltenVK.dylib");
 
         // Sanity check: the LWJGL jar on the classpath must match the version the
         // native launcher selected (AndroidLauncher sets -Dpojav.lwjgl.version and
