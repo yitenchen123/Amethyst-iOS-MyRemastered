@@ -299,6 +299,12 @@ static GameSurfaceView* pojavWindow;
 
 @end
 
+// Forward declaration: findSDL_uikitview is defined further down this file
+// (after the @implementation block, near touchesBegan). Declaring it here
+// avoids an implicit-declaration warning when pressesBegan/pressesEnded
+// forward physical keyboard events to the embedded SDL_uikitview.
+static UIView *findSDL_uikitview(UIView *root);
+
 @implementation SurfaceViewController
 
 #pragma mark - TouchController Static Library Support
