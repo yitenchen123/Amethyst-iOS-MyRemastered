@@ -280,7 +280,9 @@ native: dep_mg
 java:
 	echo '[Amethyst v$(VERSION)] java - start'
 	# 从 lwjgl-lib/ 源码构建 LWJGL jar（3.3.3 与 3.4.1）。
-	# 源码未变、或缺少 Ant/JDK 8 时脚本会直接跳过，沿用 git 中的预编译 jar。
+	# 默认跳过：预编译 jar 已在 git 中，普通构建与 CI 都不需要 Ant / JDK 8 /
+	# 网络。只有 BUILD_LWJGL=1 时才真正从源码构建（本地改 LWJGL 时用）：
+	#     BUILD_LWJGL=1 make java
 	bash $(SOURCEDIR)/scripts/build_lwjgl.sh
 	$(MAKE) -C JavaApp -j$(JOBS) BOOTJDK=$(BOOTJDK)
 	echo '[Amethyst v$(VERSION)] java - end'

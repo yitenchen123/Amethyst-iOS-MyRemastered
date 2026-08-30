@@ -9,8 +9,23 @@
 # Output: JavaApp/libs/lwjgl-333/*.jar and JavaApp/libs/lwjgl-341/*.jar
 # (the per-module jars produced by the LWJGL ant build).
 #
-# Requirements: JDK 8 (used to compile LWJGL), ant, network access on the
-# first build (ant init downloads the LWJGL build dependencies).
+# IMPORTANT: this script does NOTHING unless BUILD_LWJGL=1 is set.
+#
+# The prebuilt LWJGL jars (JavaApp/libs/lwjgl-333 and -341) are committed to
+# git and are what a normal build packages. Building from source is opt-in:
+#
+#     BUILD_LWJGL=1 make java          # or: BUILD_LWJGL=1 scripts/build_lwjgl.sh
+#
+# It previously ran unconditionally, which broke CI: GitHub's macOS runners
+# ship Apache Ant and Temurin 8, so the script really did try to compile LWJGL
+# from source, needed extra tooling plus network access, and failed in about
+# two minutes with make exit code 2. Building from source is now attempted
+# only when explicitly requested; when it is, a missing toolchain is a hard
+# error (so the request cannot silently go unfulfilled).
+#
+# Requirements when BUILD_LWJGL=1: JDK 8 (used to compile LWJGL), ant, and
+# network access on the first build (ant init downloads the LWJGL build
+# dependencies).
 #
 # Note: if the sources under lwjgl-lib/ are older than the jars already in
 # JavaApp/libs/lwjgl-*, this script skips the build entirely, so `make java`
@@ -19,29 +34,44 @@
 # git and are enough to produce a working app.
 set -euo pipefail
 
+# --- Opt-in gate (must stay before any toolchain probe) ------------------
+# Building from source is opt-in so that a normal build (and CI) never needs
+# Ant, JDK 8 or network access: the prebuilt jars are committed to git.
+if [ "${BUILD_LWJGL:-0}" != "1" ]; then
+    echo "[build_lwjgl] BUILD_LWJGL!=1 - skipping, using the prebuilt LWJGL jars."
+    echo "[build_lwjgl] (Set BUILD_LWJGL=1 to rebuild them from lwjgl-lib/ sources.)"
+    exit 0
+fi
+echo "[build_lwjgl] BUILD_LWJGL=1 - building LWJGL from source."
+# ------------------------------------------------------------------------
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCEDIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 LWJGL_LIB="$SOURCEDIR/lwjgl-lib"
 
 # JDK 8 is required by the LWJGL ant build. Accept BOOTJDK (bin dir) from
 # the Makefile, JAVA8_HOME, or fall back to java_home.
+# Resolve JAVA8_HOME defensively: under `set -e` a bare `cd` into a missing
+# BOOTJDK would abort the script before the friendly error below is printed.
 if [ -n "${BOOTJDK:-}" ]; then
-    JAVA8_HOME="$(cd "$BOOTJDK/.." && pwd)"
+    JAVA8_HOME="$(cd "$BOOTJDK/.." 2>/dev/null && pwd || true)"
 elif [ -z "${JAVA8_HOME:-}" ]; then
     JAVA8_HOME="$(/usr/libexec/java_home -v 1.8 2>/dev/null || true)"
 fi
 if [ -z "${JAVA8_HOME:-}" ] || [ ! -x "$JAVA8_HOME/bin/java" ]; then
-    echo "[build_lwjgl] JDK 8 not found - keeping the prebuilt LWJGL jars."
-    echo "[build_lwjgl] Set JAVA8_HOME or BOOTJDK to a JDK 8 to build LWJGL from source."
-    exit 0
+    echo "Error: BUILD_LWJGL=1 but JDK 8 was not found." >&2
+    echo "       Set JAVA8_HOME or BOOTJDK to a JDK 8, or unset BUILD_LWJGL" >&2
+    echo "       to use the prebuilt LWJGL jars." >&2
+    exit 1
 fi
 JAVA8_VERSION="$("$JAVA8_HOME/bin/java" -version 2>&1 | head -1)"
 echo "[build_lwjgl] Using JDK 8 at $JAVA8_HOME ($JAVA8_VERSION)"
 
 if ! command -v ant >/dev/null 2>&1; then
-    echo "[build_lwjgl] Apache Ant not found - keeping the prebuilt LWJGL jars."
-    echo "[build_lwjgl] Install Ant (brew install ant) to build LWJGL from source."
-    exit 0
+    echo "Error: BUILD_LWJGL=1 but Apache Ant was not found." >&2
+    echo "       Install it (brew install ant), or unset BUILD_LWJGL to use the" >&2
+    echo "       prebuilt LWJGL jars." >&2
+    exit 1
 fi
 echo "[build_lwjgl] Using $(ant -version)"
 
