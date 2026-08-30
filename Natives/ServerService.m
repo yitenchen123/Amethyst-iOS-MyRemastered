@@ -1,3 +1,4 @@
+#import "utils.h"
 //
 //  ServerService.m
 //  Amethyst
@@ -111,7 +112,7 @@
                       completion:(ServerDetailHandler)completion {
     if (serverID.length == 0) {
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{
-            completion(nil, [NSError errorWithDomain:@"ServerService" code:1 userInfo:@{NSLocalizedDescriptionKey: @"缺少服务器 ID"}]);
+            completion(nil, [NSError errorWithDomain:@"ServerService" code:1 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_978", nil)}]);
         });
         return;
     }
@@ -120,7 +121,7 @@
         [[ModrinthAPI sharedInstance] getServerDetailsForID:serverID completion:^(NSDictionary * _Nullable details, NSError * _Nullable error) {
             if (error || !details) {
                 if (completion) dispatch_async(dispatch_get_main_queue(), ^{
-                    completion(nil, error ?: [NSError errorWithDomain:@"ServerService" code:2 userInfo:@{NSLocalizedDescriptionKey: @"获取详情失败"}]);
+                    completion(nil, error ?: [NSError errorWithDomain:@"ServerService" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_979", nil)}]);
                 });
                 return;
             }
@@ -172,13 +173,13 @@
         forProfile:(NSString *)profileName
              error:(NSError **)error {
     if (address.length == 0) {
-        if (error) *error = [NSError errorWithDomain:@"ServerService" code:3 userInfo:@{NSLocalizedDescriptionKey: @"服务器地址为空"}];
+        if (error) *error = [NSError errorWithDomain:@"ServerService" code:3 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_980", nil)}];
         return NO;
     }
 
     NSString *profile = profileName.length ? profileName : [PLProfiles.current selectedProfileName];
     if (profile.length == 0) {
-        if (error) *error = [NSError errorWithDomain:@"ServerService" code:4 userInfo:@{NSLocalizedDescriptionKey: @"未选择 profile"}];
+        if (error) *error = [NSError errorWithDomain:@"ServerService" code:4 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_981", nil)}];
         return NO;
     }
 
@@ -204,7 +205,7 @@
                 completion:(ServerDownloadHandler)completion {
     if (!serverItem.serverPackDownloadURL || serverItem.serverPackDownloadURL.length == 0) {
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{
-            completion([NSError errorWithDomain:@"ServerService" code:5 userInfo:@{NSLocalizedDescriptionKey: @"该服务器没有可下载的服务端整合包"}]);
+            completion([NSError errorWithDomain:@"ServerService" code:5 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_982", nil)}]);
         });
         return;
     }
@@ -229,7 +230,7 @@
     NSURL *url = [NSURL URLWithString:serverItem.serverPackDownloadURL];
     if (!url) {
         if (completion) dispatch_async(dispatch_get_main_queue(), ^{
-            completion([NSError errorWithDomain:@"ServerService" code:6 userInfo:@{NSLocalizedDescriptionKey: @"无效的下载链接"}]);
+            completion([NSError errorWithDomain:@"ServerService" code:6 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_254", nil)}]);
         });
         return;
     }
@@ -288,6 +289,15 @@ didFinishDownloadingToURL:(NSURL *)location {
     NSString *destinationPath = self.downloadDestinationPaths[downloadTask];
     NSString *taskID = self.downloadTaskIDs[downloadTask];
 
+    // 关键修复（旧任务覆盖新任务）：暂停→继续→重试重建任务后，被取消的旧 downloadTask
+    // 的完成回调不得操作新任务。rawTask 指向当前活动任务，不一致即旧任务残留：丢弃。
+    if (taskID) {
+        DownloadTaskItem *item = [[DownloadTaskManager sharedManager] taskWithId:taskID];
+        if (item && item.rawTask != downloadTask) {
+            return;
+        }
+    }
+
     [self.downloadCompletionHandlers removeObjectForKey:downloadTask];
     [self.downloadDestinationPaths removeObjectForKey:downloadTask];
     [self.downloadProgressHandlers removeObjectForKey:downloadTask];
@@ -330,6 +340,14 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     void(^progress)(NSProgress *) = self.downloadProgressHandlers[downloadTask];
     NSString *taskID = self.downloadTaskIDs[downloadTask];
 
+    // 关键修复（旧任务覆盖新任务）：旧 downloadTask 的进度回调不得推进新任务进度
+    if (taskID) {
+        DownloadTaskItem *item = [[DownloadTaskManager sharedManager] taskWithId:taskID];
+        if (item && item.rawTask != downloadTask) {
+            return;
+        }
+    }
+
     if (taskID && totalBytesExpectedToWrite > 0) {
         double p = (double)totalBytesWritten / (double)totalBytesExpectedToWrite;
         [[DownloadTaskManager sharedManager] updateTaskWithId:taskID
@@ -352,6 +370,16 @@ didCompleteWithError:(NSError *)error {
     if (error) {
         ServerDownloadHandler handler = self.downloadCompletionHandlers[task];
         NSString *taskID = self.downloadTaskIDs[task];
+
+        // 关键修复（旧任务覆盖新任务）：暂停→继续→重试重建任务后，被取消/替换的旧任务
+        // 的取消回调不得把新任务打成 Failed。rawTask 指向当前活动任务，不一致即旧任务残留。
+        if (taskID) {
+            DownloadTaskItem *item = [[DownloadTaskManager sharedManager] taskWithId:taskID];
+            if (item && item.rawTask != task) {
+                return;
+            }
+        }
+
         if (taskID) {
             [[DownloadTaskManager sharedManager] setTaskWithId:taskID completedWithError:error];
         }

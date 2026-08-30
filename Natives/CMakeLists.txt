@@ -303,6 +303,7 @@ add_executable(AngelAuraAmethyst
   installer/ForgeInstallSchemeViewController.m
   installer/ForgeDirectInstaller.m
   installer/NeoForgeDirectInstaller.m
+  installer/ForgeProcessorExecutor.m
   installer/ModpackInstallViewController.m
   installer/ModLoaderInstallViewController.m
   installer/FabricUtils.m
@@ -324,12 +325,16 @@ add_executable(AngelAuraAmethyst
   InlineMessageView.m
   DownloadTaskItem.m
   DownloadTaskManager.m
+  PLTaskStage.m
+  PLTaskProgressViewController.m
   DownloadTasksViewController.m
+  DownloadHistoryViewController.m
+  DownloadHistoryStore.m
+  PLDownloadClient.m
+  PLMirrorCenter.m
   AppDelegate.m
   CustomControlsViewController.m
   CustomControlsViewController+UndoManager.m
-  DownloadProgressViewController.m
-  DownloadProgressCardView.m
   FileListViewController.m
   GameSurfaceView.m
   JavaGUIViewController.m
@@ -356,7 +361,6 @@ add_executable(AngelAuraAmethyst
   LauncherPrefGameDirViewController.m
   LauncherPrefManageJREViewController.m
   LauncherProfileEditorViewController.m
-  LauncherProfilesViewController.m
   LauncherSplitViewController.m
   MinecraftResourceDownloadTask.m
   MinecraftResourceUtils.m
@@ -380,8 +384,12 @@ add_executable(AngelAuraAmethyst
   ios_uikit_bridge.m
   utils.m
 
-  # Version card cell (shared between DownloadViewController and LauncherProfilesViewController)
+  # Version card cell (used by DownloadViewController)
   VersionCardCell.m
+
+  # Resource management shared base classes (card cell + list VC, shared by the 6 resource managers)
+  ResourceCardTableViewCell.m
+  ResourceListViewController.m
 
   # Mod-related sources (ensure implementations are compiled and linked)
   MarqueeLabel.m
@@ -403,13 +411,9 @@ add_executable(AngelAuraAmethyst
   # 统一的项目图标加载器（双层缓存+降采样+并发控制+CDN镜像，参照 FCL Glide + ZL2 Coil）
   IconLoader.m
 
-  # MCIM 模组镜像源工具类（参考 ZalithLauncher 2 MCIMMirror.kt）
-  MCIMMirror.m
-
   # Shader-related sources
   ShaderItem.m
   ShaderService.m
-  ShaderTableViewCell.m
   ShaderVersion.m
   ShaderVersionTableViewCell.m
   ShaderVersionViewController.m
@@ -423,6 +427,8 @@ add_executable(AngelAuraAmethyst
 
   # CurseForge MurmurHash2 fingerprint tool
   MurmurHash2.m
+  # CurseForge MurmurHash2 指纹便捷计算（mod 检测更新反查用，过滤空白字节后计算）
+  CurseForgeMurmurHash.m
 
   # Resource Pack / Data Pack / World management (services, items, version VC, manager VCs)
   ResourcePackItem.m
@@ -447,7 +453,6 @@ add_executable(AngelAuraAmethyst
 
   # Mod update service (dual-source SHA1/MurmurHash2 reverse lookup)
   ModUpdateService.m
-  ModUpdateViewController.m
 
   # Custom icon management sources
   CustomIconManager.m
@@ -486,6 +491,42 @@ add_executable(AngelAuraAmethyst
   MarkdownParser.m
   AnnouncementListViewController.m
   AnnouncementDetailViewController.m
+
+  # Air AI Agent（OpenAI 兼容聊天助手）
+  AI/AiProvider.m
+  AI/AiProviderStore.m
+  AI/AiMessage.m
+  AI/AiSession.m
+  AI/AiSessionStore.m
+  AI/AiSettings.m
+  AI/AiAPIClient.m
+  AI/AiAgent.m
+  AI/AIMessageCell.m
+  AI/AIInputBarView.m
+  AI/AIViewController.m
+  AI/AISessionListViewController.m
+  AI/AIProviderConfigViewController.m
+  AI/AISystemPromptEditorViewController.m
+
+  # Air AI Agent 工具基础层（3a：注册表 / 安全机制 / 实例 / 日志 / 崩溃 / 文件 / 问答）
+  AI/AiToolRegistry.m
+  AI/AiSafetyManager.m
+  AI/AiToolBootstrapper.m
+  AI/AiInstancesTool.m
+  AI/AiLogReader.m
+  AI/AiCrashAnalyzer.m
+  AI/AiFileTools.m
+  AI/AiAskTool.m
+
+  # Air AI Agent 资源/网络工具（3b：Modrinth 搜索 + 资源安装/引导）
+  AI/AiAssetTools.m
+
+  # Air AI Agent 第二轮增强（enhance-ai-agent：设置 / to-do / sleep / 下载查询 / 实例创建）
+  AI/AiSettingsTools.m
+  AI/AiTodoTool.m
+  AI/AiSleepTool.m
+  AI/AiDownloadProbe.m
+  AI/AiInstanceCreator.m
 )
 
 # Add ModLoaderIcons PNG files into the app bundle Resources/ModLoaderIcons so they are available at runtime.

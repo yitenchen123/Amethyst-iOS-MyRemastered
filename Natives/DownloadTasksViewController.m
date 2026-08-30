@@ -1,3 +1,4 @@
+#import "utils.h"
 #import "DownloadTasksViewController.h"
 #import "DownloadTaskManager.h"
 #import "DownloadTaskItem.h"
@@ -5,6 +6,9 @@
 #import "BackgroundManager.h"
 #import "IconLoader.h"
 #import "ModLoaderIconHelper.h"
+#import "DownloadHistoryViewController.h"
+#import "PLTaskStages.h"
+#import "PLTaskProgressViewController.h"
 
 static NSString * const kTaskCellReuseIdentifier = @"DownloadTaskCell";
 static NSString * const kEmptyStateReuseIdentifier = @"DownloadTaskEmptyCell";
@@ -23,6 +27,13 @@ static const CGFloat kSectionInset = 16.0;
 @property (nonatomic, strong) UIProgressView *progressView;
 @property (nonatomic, strong) UILabel *progressLabel;
 @property (nonatomic, strong) UIView *separatorView;
+
+// 阶段信息行（redesign-download-ui Task 2.4）：当前阶段名 + "3/6" 阶段计数；
+// 无阶段信息（stages 为空或 currentStageIndex 无效）时整行收起
+@property (nonatomic, strong) UILabel *stageTitleLabel;
+@property (nonatomic, strong) UILabel *stageCountLabel;
+@property (nonatomic, strong) NSLayoutConstraint *stageHeightConstraint;
+@property (nonatomic, strong) NSLayoutConstraint *progressTopConstraint;
 
 // FCL 风格操作按钮区（直接显示在卡片上，无需长按）
 @property (nonatomic, strong) UIButton *primaryActionButton;   // 暂停/继续/重试（主操作，蓝色）
@@ -110,6 +121,28 @@ static const CGFloat kSectionInset = 16.0;
     self.separatorView.backgroundColor = [UIColor separatorColor];
     [self.contentView addSubview:self.separatorView];
 
+    // 阶段信息行：左侧当前阶段名（单行截断）+ 右侧阶段计数（如 "3/6"）
+    self.stageTitleLabel = [[UILabel alloc] init];
+    self.stageTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.stageTitleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    self.stageTitleLabel.textColor = [UIColor secondaryLabelColor];
+    self.stageTitleLabel.numberOfLines = 1;
+    self.stageTitleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [self.contentView addSubview:self.stageTitleLabel];
+
+    self.stageCountLabel = [[UILabel alloc] init];
+    self.stageCountLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.stageCountLabel.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium];
+    self.stageCountLabel.textColor = [UIColor secondaryLabelColor];
+    self.stageCountLabel.textAlignment = NSTextAlignmentRight;
+    self.stageCountLabel.numberOfLines = 1;
+    [self.contentView addSubview:self.stageCountLabel];
+
+    // 阶段行高度约束（无阶段信息时置 0 收起）
+    self.stageHeightConstraint = [self.stageTitleLabel.heightAnchor constraintEqualToConstant:16.0];
+    // 进度条顶部约束（有阶段信息时位于阶段行下方，无阶段信息时回到紧贴分隔线）
+    self.progressTopConstraint = [self.progressView.topAnchor constraintEqualToAnchor:self.stageTitleLabel.bottomAnchor constant:6.0];
+
     // FCL 风格：主操作按钮（暂停/继续/重试），右侧靠齐
     self.primaryActionButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.primaryActionButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -158,9 +191,18 @@ static const CGFloat kSectionInset = 16.0;
         [self.separatorView.topAnchor constraintEqualToAnchor:self.iconImageView.bottomAnchor constant:10],
         [self.separatorView.heightAnchor constraintEqualToConstant:0.5],
 
-        // 进度区：进度条 + 百分比
+        // 阶段信息行：位于分隔线下方、进度条上方
+        [self.stageTitleLabel.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:12],
+        [self.stageTitleLabel.topAnchor constraintEqualToAnchor:self.separatorView.bottomAnchor constant:6],
+        [self.stageTitleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:self.stageCountLabel.leadingAnchor constant:-8],
+        self.stageHeightConstraint,
+
+        [self.stageCountLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-12],
+        [self.stageCountLabel.centerYAnchor constraintEqualToAnchor:self.stageTitleLabel.centerYAnchor],
+
+        // 进度区：进度条 + 百分比（顶部约束按是否有阶段信息动态调整间距）
         [self.progressView.leadingAnchor constraintEqualToAnchor:self.contentView.leadingAnchor constant:12],
-        [self.progressView.topAnchor constraintEqualToAnchor:self.separatorView.bottomAnchor constant:8],
+        self.progressTopConstraint,
         [self.progressView.trailingAnchor constraintEqualToAnchor:self.progressLabel.leadingAnchor constant:-8],
 
         [self.progressLabel.trailingAnchor constraintEqualToAnchor:self.contentView.trailingAnchor constant:-12],
@@ -219,6 +261,8 @@ static const CGFloat kSectionInset = 16.0;
     self.progressView.progress = 0.0;
     self.progressLabel.text = nil;
     self.progressView.hidden = NO;
+    self.stageTitleLabel.text = nil;
+    self.stageCountLabel.text = nil;
     self.currentTask = nil;
     [self.primaryActionButton setTitle:nil forState:UIControlStateNormal];
     self.primaryActionButton.hidden = YES;
@@ -241,41 +285,71 @@ static const CGFloat kSectionInset = 16.0;
     // 用 detectLoaderFromVersionId 解析；解析不到则用通用占位符。
     [self configureIconForTask:task];
 
+    // 阶段信息行：当前阶段名（经 PLTaskStageTitleDisplay 本地化渲染）+ 阶段计数（如 "3/6"）。
+    // stages 非空且 currentStageIndex 有效（currentStage 非 nil）时展示，否则整行收起回退原布局。
+    PLTaskStage *currentStage = task.currentStage;
+    BOOL hasStageInfo = (currentStage != nil);
+    if (hasStageInfo) {
+        self.stageTitleLabel.text = PLTaskStageTitleDisplay(currentStage.title);
+        self.stageCountLabel.text = [NSString stringWithFormat:@"%ld/%lu",
+                                     (long)task.currentStageIndex + 1, (unsigned long)task.stages.count];
+    } else {
+        self.stageTitleLabel.text = nil;
+        self.stageCountLabel.text = nil;
+    }
+    self.stageHeightConstraint.constant = hasStageInfo ? 16.0 : 0.0;
+    // 有阶段行时进度条距阶段行 6pt；无阶段行时保持原"分隔线下方 8pt"的视觉间距（6+0+2）
+    self.progressTopConstraint.constant = hasStageInfo ? 6.0 : 2.0;
+
     // 速度与进度
     switch (task.state) {
         case DownloadTaskStatePending:
-            self.speedLabel.text = @"等待中";
+            self.speedLabel.text = localize(@"i18n_str_124", nil);
             self.progressLabel.text = @"--";
             self.progressView.progress = 0.0;
             self.progressView.hidden = NO;
             break;
         case DownloadTaskStateDownloading:
-            self.speedLabel.text = [self formattedSpeed:task.speed];
+            // Phase 6 Task 6.1：多文件任务显示 "42/100 · 2.1MB/s"（文件计数 + 速率）
+            if (task.totalFileCount > 0) {
+                NSString *speedText = [self compactSpeedText:task.speed];
+                if (speedText.length > 0) {
+                    self.speedLabel.text = [NSString
+                        stringWithFormat:NSLocalizedString(@"download.progress.file_count_short",
+                                                           @"%1$ld/%2$ld · %3$@"),
+                        (long)task.completedFileCount, (long)task.totalFileCount, speedText];
+                } else {
+                    self.speedLabel.text = [NSString stringWithFormat:@"%ld/%ld",
+                                            (long)task.completedFileCount, (long)task.totalFileCount];
+                }
+            } else {
+                self.speedLabel.text = [self formattedSpeed:task.speed];
+            }
             self.progressLabel.text = [self formattedProgress:task.progress];
             self.progressView.progress = task.progress >= 0.0 ? (float)task.progress : 0.0;
             self.progressView.hidden = NO;
             break;
         case DownloadTaskStatePaused:
-            self.speedLabel.text = @"已暂停";
+            self.speedLabel.text = localize(@"i18n_str_125", nil);
             self.progressLabel.text = [self formattedProgress:task.progress];
             self.progressView.progress = task.progress >= 0.0 ? (float)task.progress : 0.0;
             self.progressView.hidden = NO;
             break;
         case DownloadTaskStateCompleted:
-            self.speedLabel.text = @"已完成";
+            self.speedLabel.text = localize(@"i18n_str_126", nil);
             self.progressLabel.text = @"100%";
             self.progressView.progress = 1.0;
             self.progressView.hidden = NO;
             break;
         case DownloadTaskStateCancelled:
-            self.speedLabel.text = @"已取消";
+            self.speedLabel.text = localize(@"i18n_str_127", nil);
             self.progressLabel.text = @"--";
             self.progressView.progress = 0.0;
             self.progressView.hidden = YES;
             break;
         case DownloadTaskStateFailed:
-            self.speedLabel.text = task.errorInfo ? task.errorInfo.localizedDescription : @"失败";
-            self.progressLabel.text = @"失败";
+            self.speedLabel.text = task.errorInfo ? task.errorInfo.localizedDescription : localize(@"i18n_str_108", nil);
+            self.progressLabel.text = localize(@"i18n_str_108", nil);
             self.progressView.progress = 0.0;
             self.progressView.hidden = YES;
             break;
@@ -293,25 +367,33 @@ static const CGFloat kSectionInset = 16.0;
         case DownloadTaskStateDownloading:
         case DownloadTaskStatePending:
             // 主操作：暂停；次操作：取消
-            [self.primaryActionButton setTitle:@"暂停" forState:UIControlStateNormal];
+            [self.primaryActionButton setTitle:localize(@"i18n_str_128", nil) forState:UIControlStateNormal];
             [self.primaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             self.primaryActionButton.backgroundColor = primaryColor;
             self.primaryActionButton.hidden = NO;
 
-            [self.secondaryActionButton setTitle:@"取消" forState:UIControlStateNormal];
+            [self.secondaryActionButton setTitle:localize(@"resman.common.cancel", nil) forState:UIControlStateNormal];
             [self.secondaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             self.secondaryActionButton.backgroundColor = secondaryColor;
             self.secondaryActionButton.hidden = NO;
             break;
 
         case DownloadTaskStatePaused:
-            // 主操作：继续；次操作：取消
-            [self.primaryActionButton setTitle:@"继续" forState:UIControlStateNormal];
-            [self.primaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-            self.primaryActionButton.backgroundColor = primaryColor;
+            // 主操作：继续（不可续传时置灰，如 App 重启恢复的暂停任务）；次操作：取消
+            if (task.supportsResume) {
+                [self.primaryActionButton setTitle:localize(@"i18n_str_129", nil) forState:UIControlStateNormal];
+                [self.primaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                self.primaryActionButton.backgroundColor = primaryColor;
+                self.primaryActionButton.userInteractionEnabled = YES;
+            } else {
+                [self.primaryActionButton setTitle:localize(@"i18n_str_130", nil) forState:UIControlStateNormal];
+                [self.primaryActionButton setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
+                self.primaryActionButton.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+                self.primaryActionButton.userInteractionEnabled = NO;
+            }
             self.primaryActionButton.hidden = NO;
 
-            [self.secondaryActionButton setTitle:@"取消" forState:UIControlStateNormal];
+            [self.secondaryActionButton setTitle:localize(@"resman.common.cancel", nil) forState:UIControlStateNormal];
             [self.secondaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             self.secondaryActionButton.backgroundColor = secondaryColor;
             self.secondaryActionButton.hidden = NO;
@@ -324,15 +406,15 @@ static const CGFloat kSectionInset = 16.0;
                             (task.maxRetryCount <= 0 || task.retryCount < task.maxRetryCount);
             if (canRetry) {
                 NSString *retryTitle = task.retryCount > 0
-                    ? [NSString stringWithFormat:@"重试 (%ld/%ld)", (long)task.retryCount, (long)task.maxRetryCount]
-                    : @"重试";
+                    ? [NSString stringWithFormat:localize(@"i18n_str_131", nil), (long)task.retryCount, (long)task.maxRetryCount]
+                    : localize(@"i18n_str_21", nil);
                 [self.primaryActionButton setTitle:retryTitle forState:UIControlStateNormal];
                 [self.primaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
                 self.primaryActionButton.backgroundColor = primaryColor;
                 self.primaryActionButton.hidden = NO;
             } else if (task.retryHandler != nil && task.retryCount >= task.maxRetryCount && task.maxRetryCount > 0) {
                 // 已达最大重试次数，显示禁用状态
-                [self.primaryActionButton setTitle:@"重试已用尽" forState:UIControlStateNormal];
+                [self.primaryActionButton setTitle:localize(@"i18n_str_132", nil) forState:UIControlStateNormal];
                 [self.primaryActionButton setTitleColor:[UIColor secondaryLabelColor] forState:UIControlStateNormal];
                 self.primaryActionButton.backgroundColor = [UIColor tertiarySystemBackgroundColor];
                 self.primaryActionButton.userInteractionEnabled = NO;
@@ -341,7 +423,7 @@ static const CGFloat kSectionInset = 16.0;
                 self.primaryActionButton.hidden = YES;
             }
 
-            [self.secondaryActionButton setTitle:@"移除" forState:UIControlStateNormal];
+            [self.secondaryActionButton setTitle:localize(@"i18n_str_133", nil) forState:UIControlStateNormal];
             [self.secondaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             self.secondaryActionButton.backgroundColor = secondaryColor;
             self.secondaryActionButton.userInteractionEnabled = YES;
@@ -353,7 +435,7 @@ static const CGFloat kSectionInset = 16.0;
             // 主操作：无；次操作：移除
             self.primaryActionButton.hidden = YES;
 
-            [self.secondaryActionButton setTitle:@"移除" forState:UIControlStateNormal];
+            [self.secondaryActionButton setTitle:localize(@"i18n_str_133", nil) forState:UIControlStateNormal];
             [self.secondaryActionButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
             self.secondaryActionButton.backgroundColor = [UIColor systemGrayColor];
             self.secondaryActionButton.userInteractionEnabled = YES;
@@ -367,15 +449,16 @@ static const CGFloat kSectionInset = 16.0;
 
 - (NSString *)displayNameForResourceType:(NSString *)type {
     NSDictionary *map = @{
-        DownloadTaskResourceTypeMinecraft: @"MC 本体",
-        DownloadTaskResourceTypeModloader: @"加载器",
+        DownloadTaskResourceTypeMinecraft: localize(@"i18n_str_113", nil),
+        DownloadTaskResourceTypeModloader: localize(@"i18n_str_114", nil),
         DownloadTaskResourceTypeMod: @"Mod",
-        DownloadTaskResourceTypeShader: @"光影包",
-        DownloadTaskResourceTypeResourcePack: @"资源包",
-        DownloadTaskResourceTypeDataPack: @"数据包",
-        DownloadTaskResourceTypeModpack: @"整合包"
+        DownloadTaskResourceTypeShader: localize(@"i18n_str_115", nil),
+        DownloadTaskResourceTypeResourcePack: localize(@"i18n_str_116", nil),
+        DownloadTaskResourceTypeDataPack: localize(@"i18n_str_117", nil),
+        DownloadTaskResourceTypeModpack: localize(@"i18n_str_118", nil),
+        DownloadTaskResourceTypeJavaRuntime: localize(@"i18n_str_120", nil)
     };
-    return map[type] ?: type ?: @"未知";
+    return map[type] ?: type ?: localize(@"i18n_str_121", nil);
 }
 
 - (NSString *)iconNameForResourceType:(NSString *)type {
@@ -386,7 +469,8 @@ static const CGFloat kSectionInset = 16.0;
         DownloadTaskResourceTypeShader: @"sun.max",
         DownloadTaskResourceTypeResourcePack: @"photo",
         DownloadTaskResourceTypeDataPack: @"archivebox",
-        DownloadTaskResourceTypeModpack: @"shippingbox"
+        DownloadTaskResourceTypeModpack: @"shippingbox",
+        DownloadTaskResourceTypeJavaRuntime: @"cpu"
     };
     return map[type] ?: @"arrow.down.circle";
 }
@@ -445,7 +529,7 @@ static const CGFloat kSectionInset = 16.0;
 
 - (NSString *)formattedSpeed:(double)speed {
     if (speed <= 0) {
-        return @"计算中...";
+        return localize(@"i18n_str_134", nil);
     }
     if (speed < 1024.0) {
         return [NSString stringWithFormat:@"%.0f B/s", speed];
@@ -453,6 +537,20 @@ static const CGFloat kSectionInset = 16.0;
         return [NSString stringWithFormat:@"%.1f KB/s", speed / 1024.0];
     } else {
         return [NSString stringWithFormat:@"%.2f MB/s", speed / (1024.0 * 1024.0)];
+    }
+}
+
+/// 紧凑速率文本（Phase 6 Task 6.1：B/KB/MB/GB 1 位小数）；速率为 0 时返回空串（隐藏速率维度）
+- (NSString *)compactSpeedText:(double)speed {
+    if (speed <= 0) return @"";
+    if (speed >= 1024.0 * 1024.0 * 1024.0) {
+        return [NSString stringWithFormat:@"%.1fGB/s", speed / (1024.0 * 1024.0 * 1024.0)];
+    } else if (speed >= 1024.0 * 1024.0) {
+        return [NSString stringWithFormat:@"%.1fMB/s", speed / (1024.0 * 1024.0)];
+    } else if (speed >= 1024.0) {
+        return [NSString stringWithFormat:@"%.1fKB/s", speed / 1024.0];
+    } else {
+        return [NSString stringWithFormat:@"%.0fB/s", speed];
     }
 }
 
@@ -505,7 +603,7 @@ static const CGFloat kSectionInset = 16.0;
         self.messageLabel.textColor = [UIColor secondaryLabelColor];
         self.messageLabel.textAlignment = NSTextAlignmentCenter;
         self.messageLabel.numberOfLines = 0;
-        self.messageLabel.text = @"暂无下载任务";
+        self.messageLabel.text = localize(@"i18n_str_135", nil);
         [self.contentView addSubview:self.messageLabel];
 
         [NSLayoutConstraint activateConstraints:@[
@@ -527,6 +625,7 @@ static const CGFloat kSectionInset = 16.0;
 @property (nonatomic, strong) UIView *headerView;
 @property (nonatomic, strong) UILabel *titleLabel;
 @property (nonatomic, strong) UIButton *closeButton;
+@property (nonatomic, strong) UIButton *historyButton;
 @property (nonatomic, strong) UISegmentedControl *stateSegmentedControl;
 @property (nonatomic, strong) UIScrollView *typeScrollView;
 @property (nonatomic, strong) UIStackView *typeStackView;
@@ -599,13 +698,13 @@ static const CGFloat kSectionInset = 16.0;
         DownloadTaskResourceTypeModpack
     ];
     self.typeDisplayNames = @{
-        DownloadTaskResourceTypeMinecraft: @"MC 本体",
-        DownloadTaskResourceTypeModloader: @"加载器",
+        DownloadTaskResourceTypeMinecraft: localize(@"i18n_str_113", nil),
+        DownloadTaskResourceTypeModloader: localize(@"i18n_str_114", nil),
         DownloadTaskResourceTypeMod: @"Mod",
-        DownloadTaskResourceTypeShader: @"光影包",
-        DownloadTaskResourceTypeResourcePack: @"资源包",
-        DownloadTaskResourceTypeDataPack: @"数据包",
-        DownloadTaskResourceTypeModpack: @"整合包"
+        DownloadTaskResourceTypeShader: localize(@"i18n_str_115", nil),
+        DownloadTaskResourceTypeResourcePack: localize(@"i18n_str_116", nil),
+        DownloadTaskResourceTypeDataPack: localize(@"i18n_str_117", nil),
+        DownloadTaskResourceTypeModpack: localize(@"i18n_str_118", nil)
     };
     self.typeCounts = [NSMutableDictionary dictionary];
 }
@@ -621,7 +720,7 @@ static const CGFloat kSectionInset = 16.0;
     self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     self.titleLabel.font = [UIFont boldSystemFontOfSize:22];
     self.titleLabel.textColor = [UIColor labelColor];
-    self.titleLabel.text = @"下载中心";
+    self.titleLabel.text = localize(@"i18n_str_136", nil);
     [self.headerView addSubview:self.titleLabel];
 
     self.closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -630,6 +729,15 @@ static const CGFloat kSectionInset = 16.0;
     self.closeButton.tintColor = [UIColor labelColor];
     [self.closeButton addTarget:self action:@selector(closeTapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.headerView addSubview:self.closeButton];
+
+    // Phase 6 Task 6.2：历史入口（关闭按钮左侧，时钟图标）
+    self.historyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.historyButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.historyButton setImage:[UIImage systemImageNamed:@"clock.arrow.circlepath"] forState:UIControlStateNormal];
+    self.historyButton.tintColor = [UIColor labelColor];
+    self.historyButton.accessibilityLabel = NSLocalizedString(@"download.history.entry", @"历史");
+    [self.historyButton addTarget:self action:@selector(historyTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.headerView addSubview:self.historyButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [self.headerView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:12],
@@ -643,12 +751,17 @@ static const CGFloat kSectionInset = 16.0;
         [self.closeButton.trailingAnchor constraintEqualToAnchor:self.headerView.trailingAnchor constant:-12],
         [self.closeButton.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
         [self.closeButton.widthAnchor constraintEqualToConstant:36],
-        [self.closeButton.heightAnchor constraintEqualToConstant:36]
+        [self.closeButton.heightAnchor constraintEqualToConstant:36],
+
+        [self.historyButton.trailingAnchor constraintEqualToAnchor:self.closeButton.leadingAnchor constant:-8],
+        [self.historyButton.centerYAnchor constraintEqualToAnchor:self.headerView.centerYAnchor],
+        [self.historyButton.widthAnchor constraintEqualToConstant:36],
+        [self.historyButton.heightAnchor constraintEqualToConstant:36]
     ]];
 }
 
 - (void)setupStateFilter {
-    self.stateSegmentedControl = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"下载中", @"已完成"]];
+    self.stateSegmentedControl = [[UISegmentedControl alloc] initWithItems:@[localize(@"resman.mods.filter.all", nil), localize(@"i18n_str_138", nil), localize(@"i18n_str_126", nil)]];
     self.stateSegmentedControl.translatesAutoresizingMaskIntoConstraints = NO;
     self.stateSegmentedControl.selectedSegmentIndex = 0;
     [self.stateSegmentedControl addTarget:self action:@selector(stateFilterChanged:) forControlEvents:UIControlEventValueChanged];
@@ -741,7 +854,7 @@ static const CGFloat kSectionInset = 16.0;
     label.font = [UIFont systemFontOfSize:16];
     label.textColor = [UIColor secondaryLabelColor];
     label.textAlignment = NSTextAlignmentCenter;
-    label.text = @"当前筛选条件下没有下载任务";
+    label.text = localize(@"i18n_str_139", nil);
     [self.emptyStateView addSubview:label];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -830,7 +943,7 @@ static const CGFloat kSectionInset = 16.0;
         [view removeFromSuperview];
     }
 
-    UIButton *allButton = [self createTypeFilterButtonWithTitle:@"全部"
+    UIButton *allButton = [self createTypeFilterButtonWithTitle:localize(@"resman.mods.filter.all", nil)
                                                           count:@(self.filteredTasks.count)
                                                         selected:(self.filterType == nil)];
     [allButton addTarget:self action:@selector(typeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
@@ -886,6 +999,16 @@ static const CGFloat kSectionInset = 16.0;
     [self dismissViewControllerAnimated:YES completion:nil];
 }
 
+/// Phase 6 Task 6.2：打开下载历史页。
+/// 下载中心本身是无导航栏的 FormSheet 弹窗，历史页以 PageSheet + UINavigationController
+/// 模态弹出（风格与现有弹窗层级一致，iOS 14 兼容，下滑即可关闭）。
+- (void)historyTapped:(UIButton *)sender {
+    DownloadHistoryViewController *historyVC = [[DownloadHistoryViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:historyVC];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
 - (void)stateFilterChanged:(UISegmentedControl *)sender {
     switch (sender.selectedSegmentIndex) {
         case 0:
@@ -928,13 +1051,13 @@ static const CGFloat kSectionInset = 16.0;
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"切换下载源"
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_140", nil)
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *action) {
         [self showSourceSwitcherForTask:task];
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"关闭"
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_141", nil)
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
@@ -948,8 +1071,8 @@ static const CGFloat kSectionInset = 16.0;
 }
 
 - (void)showSourceSwitcherForTask:(DownloadTaskItem *)task {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"切换下载源"
-                                                                   message:[NSString stringWithFormat:@"当前源: %@", task.downloadSource ?: @"official"]
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_140", nil)
+                                                                   message:[NSString stringWithFormat:localize(@"i18n_str_142", nil), task.downloadSource ?: @"official"]
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSString *> *sources = @[@"official", @"bmclapi"];
@@ -962,7 +1085,7 @@ static const CGFloat kSectionInset = 16.0;
         }]];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil)
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
 
@@ -985,16 +1108,16 @@ static const CGFloat kSectionInset = 16.0;
             if (!strongSelf) return;
 
             if (error) {
-                [strongSelf showAlert:@"切换失败" message:error.localizedDescription];
+                [strongSelf showAlert:localize(@"i18n_str_143", nil) message:error.localizedDescription];
                 return;
             }
 
             if (!supportsResume) {
-                UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"切换下载源"
-                                                                                 message:@"该源不支持断点续传，确认后将重新从头下载。"
+                UIAlertController *confirm = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_140", nil)
+                                                                                 message:localize(@"i18n_str_144", nil)
                                                                           preferredStyle:UIAlertControllerStyleAlert];
-                [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                [confirm addAction:[UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+                [confirm addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
+                [confirm addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_145", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
                     [[DownloadTaskManager sharedManager] cancelTaskWithId:task.taskId];
                     // 业务方在取消后需要重新创建下载任务；这里仅更新源并移除旧记录。
                     [[DownloadTaskManager sharedManager] removeTaskWithId:task.taskId];
@@ -1012,7 +1135,7 @@ static const CGFloat kSectionInset = 16.0;
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                    message:message
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_44", nil) style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -1051,6 +1174,18 @@ static const CGFloat kSectionInset = 16.0;
     return cell;
 }
 
+#pragma mark - UICollectionViewDelegate
+
+/// 点击任务卡片打开统一进度页（redesign-download-ui Task 2.4）。
+/// 卡片上的操作按钮（暂停/继续/取消/重试/移除）会拦截自身点击，不与本回调冲突；
+/// 长按切源等既有交互不受影响。
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.filteredTasks.count == 0) return;
+    if (indexPath.item >= self.filteredTasks.count) return;
+    DownloadTaskItem *task = self.filteredTasks[indexPath.item];
+    [PLTaskProgressViewController presentForTaskId:task.taskId];
+}
+
 #pragma mark - UICollectionViewDelegateFlowLayout
 
 - (CGSize)collectionView:(UICollectionView *)collectionView layout:(UICollectionViewLayout *)collectionViewLayout sizeForItemAtIndexPath:(NSIndexPath *)indexPath {
@@ -1059,7 +1194,8 @@ static const CGFloat kSectionInset = 16.0;
     }
 
     CGFloat width = collectionView.bounds.size.width - kSectionInset * 2;
-    return CGSizeMake(width, 152);
+    // 阶段信息行（约 20pt：16 高 + 间距）计入卡片高度
+    return CGSizeMake(width, 172);
 }
 
 - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {

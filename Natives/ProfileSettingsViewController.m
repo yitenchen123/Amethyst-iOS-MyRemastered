@@ -13,7 +13,9 @@
 #import "ios_uikit_bridge.h" // for showDialog
 #import "utils.h"
 #import "BackgroundManager.h"
-#import "DownloadProgressCardView.h"
+#import "DownloadTaskManager.h"
+#import "DownloadTaskItem.h"
+#import "PLTaskStages.h"
 #import "ModpackExportService.h" // for parseVersionId:
 
 @interface ProfileSettingsViewController () <UITextFieldDelegate, UIPickerViewDataSource, UIPickerViewDelegate>
@@ -53,6 +55,35 @@
 
 @end
 
+// 已汉化/英化的行标题显示映射：模块标题在 self.sections 中仍保留中文作为逻辑键（isEqualToString 比较），
+// 仅在渲染 cell 时翻译为界面语言。若命中的键不存在会回退为标题本身。
+static NSString * localizeProfileTitle(NSString *title) {
+    static NSDictionary *map = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        map = @{
+            @"渲染器": @"preference.title.renderer",
+            @"图形 API": @"i18n_str_2057",
+            @"Java版本": @"i18n_str_2036",
+            @"内存分配": @"i18n_str_2037",
+            @"JVM 启动参数": @"preference.title.java_args",
+            @"清除JVM参数": @"i18n_str_2038",
+            @"名称": @"preference.profile.title.name",
+            @"游戏版本": @"i18n_str_2031",
+            @"游戏目录": @"preference.title.game_directory",
+            @"模组管理": @"i18n_str_2039",
+            @"光影管理": @"i18n_str_2016",
+            @"资源包管理": @"i18n_str_2040",
+            @"数据包管理": @"i18n_str_2041",
+            @"世界管理": @"i18n_str_2042",
+            @"Fabric API": @"Fabric API",
+            @"OptiFine": @"OptiFine",
+        };
+    });
+    NSString *key = map[title] ?: title;
+    return localize(key, nil);
+}
+
 @implementation ProfileSettingsViewController
 
 #pragma mark - Lifecycle
@@ -80,7 +111,7 @@
         self.profile[@"name"] = self.originalName;
     }
 
-    self.title = [NSString stringWithFormat:@"%@ 设置", self.originalName];
+    self.title = [NSString stringWithFormat:localize(@"i18n_str_863", nil), self.originalName];
 
     // 导航栏按钮
     self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone target:self action:@selector(actionDone)];
@@ -314,7 +345,7 @@
 
     UILabel *pillLabel = [[UILabel alloc] init];
     NSString *currentVersion = self.profile[@"lastVersionId"];
-    pillLabel.text = currentVersion.length > 0 ? currentVersion : @"未选择";
+    pillLabel.text = currentVersion.length > 0 ? currentVersion : localize(@"i18n_str_864", nil);
     pillLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightBold];
     pillLabel.textColor = [UIColor whiteColor];
     pillLabel.adjustsFontSizeToFitWidth = YES;
@@ -414,7 +445,7 @@
                 label.text = self.profile[@"name"] ?: self.originalName ?: @"New Profile";
             } else if (label.font.pointSize <= 11) {
                 NSString *currentVersion = self.profile[@"lastVersionId"];
-                label.text = currentVersion.length > 0 ? currentVersion : @"未选择";
+                label.text = currentVersion.length > 0 ? currentVersion : localize(@"i18n_str_864", nil);
             } else {
                 NSString *gameDir = self.profile[@"gameDir"] ?: @".";
                 NSString *instanceName = getPrefObject(@"general.game_directory") ?: @"default";
@@ -499,7 +530,7 @@
         @[@"模组管理", @"光影管理", @"资源包管理", @"数据包管理", @"世界管理"],
         @[@"Fabric API", @"OptiFine"],
         [advancedRows copy],
-        @[@"服务器地址"]
+        @[localize(@"i18n_str_730", nil)]
     ];
 }
 
@@ -628,11 +659,11 @@
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     NSInteger globalSection = [self globalSectionForTableView:tableView localSection:section];
     switch (globalSection) {
-        case 0: return @"版本信息";
-        case 1: return @"资源管理";
-        case 2: return @"组件安装";
-        case 3: return @"高级设置";
-        case 4: return @"服务器";
+        case 0: return localize(@"i18n_str_289", nil);
+        case 1: return localize(@"i18n_str_877", nil);
+        case 2: return localize(@"i18n_str_878", nil);
+        case 3: return localize(@"i18n_str_879", nil);
+        case 4: return localize(@"i18n_str_880", nil);
         default: return nil;
     }
 }
@@ -640,13 +671,13 @@
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     NSInteger globalSection = [self globalSectionForTableView:tableView localSection:section];
     if (globalSection == 0) {
-        return @"游戏目录决定存档/模组/配置文件的隔离位置\n\".\" = 使用当前游戏目录切换选中的实例\n点击可修改为相对/绝对路径实现版本隔离";
+        return localize(@"i18n_str_881", nil);
     }
     if (globalSection == 2) {
-        return @"Fabric API：Fabric 模组的依赖库（仅 Fabric 加载器有效）\nOptiFine：OptiFine 优化模组（仅原版/Forge 有效）";
+        return localize(@"i18n_str_882", nil);
     }
     if (globalSection == 4) {
-        return @"启动游戏后自动加入此服务器（参照 FCL）\n格式：host 或 host:port（IPv6 为 [host]:port），留空则不自动加入";
+        return localize(@"i18n_str_883", nil);
     }
     return nil;
 }
@@ -673,7 +704,7 @@
     if (globalSection < 0 || globalSection >= (NSInteger)self.sections.count) return cell;
 
     NSString *title = self.sections[globalSection][indexPath.row];
-    cell.textLabel.text = title;
+    cell.textLabel.text = localizeProfileTitle(title);
 
     switch (globalSection) {
         case 0: // 版本信息
@@ -717,12 +748,12 @@
                 cell.imageView.image = [UIImage systemImageNamed:@"bolt.fill"];
                 cell.imageView.tintColor = [UIColor systemOrangeColor];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                cell.detailTextLabel.text = [self isFabricProfile] ? @"点击安装" : @"仅 Fabric 有效";
+                cell.detailTextLabel.text = [self isFabricProfile] ? localize(@"i18n_str_2043", nil) : localize(@"i18n_str_885", nil);
             } else if ([title isEqualToString:@"OptiFine"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"speedometer"];
                 cell.imageView.tintColor = [UIColor systemRedColor];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                cell.detailTextLabel.text = [self isOptiFineCompatibleProfile] ? @"点击安装" : @"仅原版/Forge 有效";
+                cell.detailTextLabel.text = [self isOptiFineCompatibleProfile] ? localize(@"i18n_str_2043", nil) : localize(@"i18n_str_886", nil);
             }
             break;
 
@@ -738,7 +769,7 @@
             } else if ([title isEqualToString:@"Java版本"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"j.square"];
                 cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-                cell.detailTextLabel.text = [self.selectedJavaVersion isEqualToString:@"0"] ? @"自动" : [NSString stringWithFormat:@"Java %@", self.selectedJavaVersion];
+                cell.detailTextLabel.text = [self.selectedJavaVersion isEqualToString:@"0"] ? localize(@"preference.auto", nil) : [NSString stringWithFormat:@"Java %@", self.selectedJavaVersion];
             } else if ([title isEqualToString:@"内存分配"]) {
                 cell.imageView.image = [UIImage systemImageNamed:@"memorychip"];
                 cell.accessoryType = UITableViewCellAccessoryNone;
@@ -751,7 +782,7 @@
                 cell.imageView.image = [UIImage systemImageNamed:@"trash"];
                 cell.imageView.tintColor = [UIColor systemRedColor];
                 cell.textLabel.textColor = [UIColor systemRedColor];
-                cell.detailTextLabel.text = self.javaArgs.length > 0 ? @"点击清除" : @"(无参数)";
+                cell.detailTextLabel.text = self.javaArgs.length > 0 ? localize(@"i18n_str_2044", nil) : localize(@"i18n_str_889", nil);
             }
             break;
 
@@ -775,7 +806,7 @@
         }
     }
     UITextField *textField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 200, 30)];
-    textField.placeholder = @"版本名称";
+    textField.placeholder = localize(@"i18n_str_890", nil);
     textField.text = self.profile[@"name"];
     textField.font = [UIFont systemFontOfSize:14];
     textField.adjustsFontSizeToFitWidth = YES;
@@ -814,7 +845,7 @@
 
     self.versionPickerToolbar = [[UIToolbar alloc] initWithFrame:CGRectMake(0, 0, self.view.frame.size.width, 44)];
     self.versionTypeControl = [[UISegmentedControl alloc] initWithItems:@[
-        @"已安装", @"正式版", @"快照", @"Old-beta", @"Old-alpha"
+        localize(@"i18n_str_891", nil), localize(@"i18n_str_2058", nil), localize(@"i18n_str_1288", nil), @"Old-beta", @"Old-alpha"
     ]];
     [self.versionTypeControl addTarget:self action:@selector(changeVersionType:) forControlEvents:UIControlEventValueChanged];
     self.versionPickerToolbar.items = @[
@@ -955,7 +986,7 @@
 
 - (UITextField *)buildServerIpTextField {
     UITextField *textField = [[UITextField alloc] initWithFrame:CGRectMake(0, 0, 220, 30)];
-    textField.placeholder = @"如 example.com:25565（留空则不自动加入）";
+    textField.placeholder = localize(@"i18n_str_893", nil);
     textField.text = self.serverIp;
     textField.font = [UIFont systemFontOfSize:13];
     textField.adjustsFontSizeToFitWidth = YES;
@@ -1021,23 +1052,23 @@
 /// 一键清除当前版本已设置的 JVM 启动参数
 - (void)clearJavaArgs {
     if (self.javaArgs.length == 0) {
-        UIAlertController *tip = [UIAlertController alertControllerWithTitle:@"提示"
-                                                                     message:@"当前没有已设置的 JVM 启动参数"
+        UIAlertController *tip = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_388", nil)
+                                                                     message:localize(@"i18n_str_894", nil)
                                                               preferredStyle:UIAlertControllerStyleAlert];
-        [tip addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+        [tip addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_44", nil) style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:tip animated:YES completion:nil];
         return;
     }
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清除 JVM 启动参数"
-                                                                   message:@"确定要清除当前版本的 JVM 启动参数吗？此操作不可撤销。"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_895", nil)
+                                                                   message:localize(@"i18n_str_896", nil)
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
-    [alert addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_77", nil) style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
         self.javaArgs = @"";
         self.javaArgsTextField.text = @"";
         [self saveSettings];
         [self reloadAllTableViews];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
     if (alert.popoverPresentationController) {
         alert.popoverPresentationController.sourceView = self.view;
         alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 1, 1);
@@ -1175,12 +1206,12 @@
     NSString *currentInstance = getPrefObject(@"general.game_directory") ?: @"default";
 
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"游戏目录"
+        alertControllerWithTitle:localize(@"i18n_str_2004", nil)
                          message:[NSString stringWithFormat:
-                                  @"设定此版本使用的游戏目录。\n\n"
-                                   "\".\" = 使用当前游戏目录切换选中的实例（%@）\n"
-                                   "相对路径 = 相对于当前游戏目录的子目录（用于版本隔离）\n"
-                                   "绝对路径 = 使用指定路径",
+                                  [[[localize(@"i18n_str_897", nil)
+                                      stringByAppendingString:localize(@"i18n_str_2010", nil)]
+                                     stringByAppendingString:localize(@"i18n_str_2011", nil)]
+                                    stringByAppendingString:localize(@"i18n_str_2012", nil)],
                                   currentInstance]
                   preferredStyle:UIAlertControllerStyleAlert];
 
@@ -1192,16 +1223,16 @@
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"恢复默认" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_898", nil) style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
         self.profile[@"gameDir"] = @".";
         [self saveSettings];
         [self reloadAllTableViews];
         [self updateHeroCard];
     }]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_44", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *newGameDir = alert.textFields.firstObject.text;
         newGameDir = [newGameDir stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (newGameDir.length == 0) {
@@ -1219,7 +1250,6 @@
 - (void)openModsManager {
     ModsManagerViewController *vc = [[ModsManagerViewController alloc] init];
     vc.profileName = [self currentProfileName];
-    vc.initialMode = ModsManagerModeLocal;
     [self.navigationController pushViewController:vc animated:YES];
 }
 
@@ -1345,22 +1375,22 @@
 
 - (void)installFabricAPIStandalone {
     if (![self isFabricProfile]) {
-        [self showComponentAlert:@"无法安装"
-                          message:@"Fabric API 仅对 Fabric 加载器有效。\n\n当前版本不是 Fabric 加载器，无法安装 Fabric API。\n\n如需使用 Fabric，请到下载页面安装 Fabric 加载器。"];
+        [self showComponentAlert:localize(@"i18n_str_899", nil)
+                          message:localize(@"i18n_str_900", nil)];
         return;
     }
 
     NSString *gameVersion = [self currentGameVersion];
     if (!gameVersion) {
-        [self showComponentAlert:@"无法安装" message:@"无法解析当前版本的游戏版本号"];
+        [self showComponentAlert:localize(@"i18n_str_899", nil) message:localize(@"i18n_str_901", nil)];
         return;
     }
 
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"安装 Fabric API"
-                                                                     message:[NSString stringWithFormat:@"Fabric API 是大多数 Fabric 模组的依赖库。\n\n将下载适配 Minecraft %@ 的最新 Fabric API 到 mods 目录。\n\n游戏版本：%@", gameVersion, gameVersion]
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_902", nil)
+                                                                     message:[NSString stringWithFormat:localize(@"i18n_str_903", nil), gameVersion, gameVersion]
                                                               preferredStyle:UIAlertControllerStyleAlert];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"安装" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
+    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_904", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         [self startInstallFabricAPIWithGameVersion:gameVersion];
     }]];
     [self presentViewController:confirm animated:YES completion:nil];
@@ -1368,14 +1398,14 @@
 
 - (void)installOptiFineStandalone {
     if (![self isOptiFineCompatibleProfile]) {
-        [self showComponentAlert:@"无法安装"
-                          message:@"OptiFine 仅对原版 (Vanilla) 和 Forge 加载器有效。\n\n当前版本不兼容 OptiFine。\n\nFabric/Quilt/NeoForge 加载器请使用其他优化模组（如 Sodium 等）。"];
+        [self showComponentAlert:localize(@"i18n_str_899", nil)
+                          message:localize(@"i18n_str_905", nil)];
         return;
     }
 
     NSString *gameVersion = [self currentGameVersion];
     if (!gameVersion) {
-        [self showComponentAlert:@"无法安装" message:@"无法解析当前版本的游戏版本号"];
+        [self showComponentAlert:localize(@"i18n_str_899", nil) message:localize(@"i18n_str_901", nil)];
         return;
     }
 
@@ -1386,25 +1416,25 @@
     BOOL isVanilla = [self isVanillaProfile];
     NSString *message = nil;
     if (isVanilla) {
-        message = [NSString stringWithFormat:
-                   @"OptiFine 是 Minecraft 的优化模组，提供光影支持和高帧率。\n\n"
-                   @"将下载适配 Minecraft %@ 的最新 OptiFine 并以版本补丁方式安装（参照 FCL/HMCL）：\n"
-                   @"  • 创建独立版本：%@-OptiFine_xxx\n"
-                   @"  • 通过 launchwrapper + optifine.OptiFineTweaker 加载\n"
-                   @"  • 安装完成后会自动切换到新版本\n\n"
-                   @"游戏版本：%@", gameVersion, gameVersion, gameVersion];
+        NSString *fmt = [[[[[localize(@"i18n_str_906", nil)
+                              stringByAppendingString:localize(@"i18n_str_907", nil)]
+                             stringByAppendingString:localize(@"i18n_str_2006", nil)]
+                            stringByAppendingString:localize(@"i18n_str_2007", nil)]
+                           stringByAppendingString:localize(@"i18n_str_2008", nil)]
+                          stringByAppendingString:localize(@"i18n_str_911", nil)];
+        message = [NSString stringWithFormat:fmt, gameVersion, gameVersion, gameVersion];
     } else {
-        message = [NSString stringWithFormat:
-                   @"OptiFine 是 Minecraft 的优化模组，提供光影支持和高帧率。\n\n"
-                   @"将下载适配 Minecraft %@ 的最新 OptiFine 到 mods 目录（Forge 加载器方式）。\n\n"
-                   @"游戏版本：%@（当前为 Forge 加载器）", gameVersion, gameVersion];
+        NSString *fmt = [[localize(@"i18n_str_906", nil)
+                          stringByAppendingString:localize(@"i18n_str_912", nil)]
+                         stringByAppendingString:localize(@"i18n_str_913", nil)];
+        message = [NSString stringWithFormat:fmt, gameVersion, gameVersion];
     }
 
-    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"安装 OptiFine"
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_914", nil)
                                                                      message:message
                                                               preferredStyle:UIAlertControllerStyleAlert];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"安装" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
+    [confirm addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_904", nil) style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         if (isVanilla) {
             [self startInstallOptiFineAsPatch:gameVersion];
         } else {
@@ -1416,7 +1446,7 @@
 
 - (void)showComponentAlert:(NSString *)title message:(NSString *)message {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_322", nil) style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -1437,10 +1467,30 @@
 }
 
 - (void)startInstallFabricAPIWithGameVersion:(NSString *)gameVersion {
-    // 使用统一下载进度卡片（DownloadProgressCardView），删除散落的 alert+spinner
-    UIView *hostView = self.view.window ?: self.view;
-    DownloadProgressCardView *progress = [DownloadProgressCardView showInParentView:hostView title:@"正在安装 Fabric API"];
-    [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:[NSString stringWithFormat:@"正在搜索适配 %@ 的 Fabric API...", gameVersion]];
+    // redesign-download-ui Phase 4 Task 4.4：Fabric API 安装注册为统一下载任务，
+    // PLTaskStagesSingleFile 单阶段 + autoPresentDetail 自动弹出统一进度页
+    DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+    DownloadTaskItem *taskItem = [manager
+        registerTaskWithResourceType:DownloadTaskResourceTypeMod
+                        resourceName:[NSString stringWithFormat:@"fabric-api-%@", gameVersion]
+                         displayName:@"Fabric API"
+                      downloadSource:@"modrinth"
+                             rawTask:nil
+                      supportsResume:NO
+                             iconURL:nil];
+    NSString *taskId = taskItem.taskId;
+    if (taskItem) {
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId stages:PLTaskStagesSingleFile()];
+        taskItem.autoPresentDetail = YES;
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateDownloading];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                       status:PLTaskStageStatusRunning];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                     progress:-1.0
+                                                      message:[NSString stringWithFormat:localize(@"i18n_str_915", nil), gameVersion]];
+    }
 
     NSMutableDictionary *filters = [NSMutableDictionary dictionary];
     filters[@"query"] = @"fabric api";
@@ -1453,11 +1503,11 @@
             if (!strongSelf) return;
 
             if (error || results.count == 0) {
-                [progress failWithError:[NSError errorWithDomain:@"FabricAPI" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"未找到 Fabric API：%@", error.localizedDescription ?: @"无搜索结果"]}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"未找到 Fabric API：%@", error.localizedDescription ?: @"无搜索结果"]];
-                });
+                NSError *failError = [NSError errorWithDomain:@"FabricAPI" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_916", nil), error.localizedDescription ?: localize(@"i18n_str_917", nil)]}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_916", nil), error.localizedDescription ?: localize(@"i18n_str_917", nil)]];
                 return;
             }
 
@@ -1471,15 +1521,18 @@
                 }
             }
             if (!fabricAPI) {
-                [progress failWithError:[NSError errorWithDomain:@"FabricAPI" code:2 userInfo:@{NSLocalizedDescriptionKey: @"未找到合适的 Fabric API 项目"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf showComponentAlert:@"安装失败" message:@"未找到合适的 Fabric API 项目"];
-                });
+                NSError *failError = [NSError errorWithDomain:@"FabricAPI" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_919", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf showComponentAlert:localize(@"i18n_str_918", nil) message:localize(@"i18n_str_919", nil)];
                 return;
             }
 
-            [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:@"正在获取 Fabric API 版本列表..."];
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                     stageAtIndex:0
+                                                         progress:-1.0
+                                                          message:localize(@"i18n_str_920", nil)];
 
             [[ModrinthAPI sharedInstance] getVersionsForModWithID:fabricAPI[@"id"] completion:^(NSArray<ModVersion *> *versions, NSError *versionError) {
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -1487,11 +1540,11 @@
                     if (!strongSelf2) return;
 
                     if (versionError || versions.count == 0) {
-                        [progress failWithError:[NSError errorWithDomain:@"FabricAPI" code:3 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"获取 Fabric API 版本失败：%@", versionError.localizedDescription ?: @"无版本"]}]];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [progress dismiss];
-                            [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"获取 Fabric API 版本失败：%@", versionError.localizedDescription ?: @"无版本"]];
-                        });
+                        NSError *failError = [NSError errorWithDomain:@"FabricAPI" code:3 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_921", nil), versionError.localizedDescription ?: localize(@"i18n_str_463", nil)]}];
+                        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                        [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                        [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_921", nil), versionError.localizedDescription ?: localize(@"i18n_str_463", nil)]];
                         return;
                     }
 
@@ -1509,25 +1562,25 @@
 
                     NSDictionary *primaryFile = matchingVersion.primaryFile;
                     if (!primaryFile || ![primaryFile[@"url"] isKindOfClass:[NSString class]]) {
-                        [progress failWithError:[NSError errorWithDomain:@"FabricAPI" code:4 userInfo:@{NSLocalizedDescriptionKey: @"Fabric API 文件信息无效"}]];
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            [progress dismiss];
-                            [strongSelf2 showComponentAlert:@"安装失败" message:@"Fabric API 文件信息无效"];
-                        });
+                        NSError *failError = [NSError errorWithDomain:@"FabricAPI" code:4 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_922", nil)}];
+                        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                        [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                        [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:localize(@"i18n_str_922", nil)];
                         return;
                     }
 
                     [strongSelf2 downloadFabricAPIFile:primaryFile[@"url"]
                                                 filename:primaryFile[@"filename"]
-                                              progress:progress
-                                              modInfo:fabricAPI];
+                                                  taskId:taskId
+                                                 modInfo:fabricAPI];
                 });
             }];
         });
     }];
 }
 
-- (void)downloadFabricAPIFile:(NSString *)urlString filename:(NSString *)filename progress:(DownloadProgressCardView *)progress modInfo:(NSDictionary *)modInfo {
+- (void)downloadFabricAPIFile:(NSString *)urlString filename:(NSString *)filename taskId:(NSString *)taskId modInfo:(NSDictionary *)modInfo {
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         __strong typeof(weakSelf) strongSelf = weakSelf;
@@ -1542,11 +1595,11 @@
             if (!strongSelf2) return;
 
             if (!data || downloadError) {
-                [progress failWithError:downloadError ?: [NSError errorWithDomain:@"FabricAPI" code:5 userInfo:@{NSLocalizedDescriptionKey: @"下载失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"下载 Fabric API 失败：%@", downloadError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = downloadError ?: [NSError errorWithDomain:@"FabricAPI" code:5 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_448", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_923", nil), downloadError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
                 return;
             }
 
@@ -1558,27 +1611,49 @@
             BOOL success = [data writeToFile:savePath options:NSDataWritingAtomic error:&writeError];
 
             if (success) {
-                [progress completeWithTitle:@"Fabric API 安装完成"];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装成功" message:[NSString stringWithFormat:@"Fabric API 已安装到 mods 目录：\n%@", saveFilename]];
-                });
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                          stageAtIndex:0
+                                                               progress:1.0
+                                                               message:[NSString stringWithFormat:localize(@"i18n_str_924", nil), saveFilename]];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateCompleted];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_253", nil) message:[NSString stringWithFormat:localize(@"i18n_str_925", nil), saveFilename]];
             } else {
-                [progress failWithError:writeError ?: [NSError errorWithDomain:@"FabricAPI" code:6 userInfo:@{NSLocalizedDescriptionKey: @"写入失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"写入文件失败：%@", writeError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = writeError ?: [NSError errorWithDomain:@"FabricAPI" code:6 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_926", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_927", nil), writeError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
             }
         });
     });
 }
 
 - (void)startInstallOptiFineWithGameVersion:(NSString *)gameVersion {
-    // 使用统一下载进度卡片（DownloadProgressCardView），删除散落的 alert+spinner
-    UIView *hostView = self.view.window ?: self.view;
-    DownloadProgressCardView *progress = [DownloadProgressCardView showInParentView:hostView title:@"正在安装 OptiFine"];
-    [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:[NSString stringWithFormat:@"正在查询适配 %@ 的 OptiFine 版本...", gameVersion]];
+    // redesign-download-ui Phase 4 Task 4.4：OptiFine（mods 方式）注册为统一下载任务，
+    // PLTaskStagesSingleFile 单阶段 + autoPresentDetail 自动弹出统一进度页
+    DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+    DownloadTaskItem *taskItem = [manager
+        registerTaskWithResourceType:DownloadTaskResourceTypeMod
+                        resourceName:[NSString stringWithFormat:@"optifine-%@", gameVersion]
+                         displayName:@"OptiFine"
+                      downloadSource:@"bmclapi"
+                             rawTask:nil
+                      supportsResume:NO
+                             iconURL:nil];
+    NSString *taskId = taskItem.taskId;
+    if (taskItem) {
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId stages:PLTaskStagesSingleFile()];
+        taskItem.autoPresentDetail = YES;
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateDownloading];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                       status:PLTaskStageStatusRunning];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                     progress:-1.0
+                                                      message:[NSString stringWithFormat:localize(@"i18n_str_928", nil), gameVersion]];
+    }
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1612,17 +1687,20 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:[NSError errorWithDomain:@"OptiFine" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"未找到适配 Minecraft %@ 的 OptiFine 版本", gameVersion]}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"未找到适配 Minecraft %@ 的 OptiFine 版本", gameVersion]];
-                });
+                NSError *failError = [NSError errorWithDomain:@"OptiFine" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_929", nil), gameVersion]}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_929", nil), gameVersion]];
             });
             return;
         }
 
         // 切换到下载阶段
-        [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:[NSString stringWithFormat:@"正在下载 OptiFine %@ %@", optiFineType, optiFinePatch]];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                     progress:-1.0
+                                                      message:[NSString stringWithFormat:localize(@"i18n_str_930", nil), optiFineType, optiFinePatch]];
 
         // 下载 OptiFine
         NSString *downloadURL = [NSString stringWithFormat:@"https://bmclapi2.bangbang93.com/optifine/%@/%@/%@", gameVersion, optiFineType, optiFinePatch];
@@ -1647,11 +1725,11 @@
             if (!strongSelf2) return;
 
             if (!data || downloadError) {
-                [progress failWithError:downloadError ?: [NSError errorWithDomain:@"OptiFine" code:2 userInfo:@{NSLocalizedDescriptionKey: @"下载失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"下载 OptiFine 失败：%@", downloadError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = downloadError ?: [NSError errorWithDomain:@"OptiFine" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_448", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_931", nil), downloadError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
                 return;
             }
 
@@ -1663,17 +1741,19 @@
             BOOL success = [data writeToFile:savePath options:NSDataWritingAtomic error:&writeError];
 
             if (success) {
-                [progress completeWithTitle:@"OptiFine 安装完成"];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装成功" message:[NSString stringWithFormat:@"OptiFine %@ %@ 已安装到 mods 目录", optiFineType, optiFinePatch]];
-                });
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                          stageAtIndex:0
+                                                               progress:1.0
+                                                               message:[NSString stringWithFormat:localize(@"i18n_str_924", nil), saveFilename]];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateCompleted];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_253", nil) message:[NSString stringWithFormat:localize(@"i18n_str_932", nil), optiFineType, optiFinePatch]];
             } else {
-                [progress failWithError:writeError ?: [NSError errorWithDomain:@"OptiFine" code:3 userInfo:@{NSLocalizedDescriptionKey: @"写入失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"写入文件失败：%@", writeError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = writeError ?: [NSError errorWithDomain:@"OptiFine" code:3 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_926", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_927", nil), writeError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
             }
         });
     });
@@ -1689,9 +1769,30 @@
 ///   3. inheritsFrom 指向原版版本（vanilla parent 必须已存在）
 ///   4. 创建新 profile 并切换为当前 profile
 - (void)startInstallOptiFineAsPatch:(NSString *)gameVersion {
-    UIView *hostView = self.view.window ?: self.view;
-    DownloadProgressCardView *progress = [DownloadProgressCardView showInParentView:hostView title:@"正在安装 OptiFine"];
-    [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:[NSString stringWithFormat:@"正在查询适配 %@ 的 OptiFine 版本...", gameVersion]];
+    // redesign-download-ui Phase 4 Task 4.4：OptiFine 版本补丁安装注册为统一下载任务，
+    // PLTaskStagesSingleFile 单阶段 + autoPresentDetail 自动弹出统一进度页
+    DownloadTaskManager *manager = [DownloadTaskManager sharedManager];
+    DownloadTaskItem *taskItem = [manager
+        registerTaskWithResourceType:DownloadTaskResourceTypeModloader
+                        resourceName:[NSString stringWithFormat:@"optifine-patch-%@", gameVersion]
+                         displayName:[NSString stringWithFormat:@"OptiFine (%@)", gameVersion]
+                      downloadSource:@"bmclapi"
+                             rawTask:nil
+                      supportsResume:NO
+                             iconURL:nil];
+    NSString *taskId = taskItem.taskId;
+    if (taskItem) {
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId stages:PLTaskStagesSingleFile()];
+        taskItem.autoPresentDetail = YES;
+        [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateDownloading];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                       status:PLTaskStageStatusRunning];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                     progress:-1.0
+                                                      message:[NSString stringWithFormat:localize(@"i18n_str_928", nil), gameVersion]];
+    }
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -1725,17 +1826,20 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:[NSError errorWithDomain:@"OptiFine" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"未找到适配 Minecraft %@ 的 OptiFine 版本", gameVersion]}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"未找到适配 Minecraft %@ 的 OptiFine 版本", gameVersion]];
-                });
+                NSError *failError = [NSError errorWithDomain:@"OptiFine" code:1 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_929", nil), gameVersion]}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_929", nil), gameVersion]];
             });
             return;
         }
 
         // 2. 下载 OptiFine jar
-        [progress updateProgress:-1 downloaded:0 total:0 speed:0 eta:-1 currentFile:[NSString stringWithFormat:@"正在下载 OptiFine %@ %@", optiFineType, optiFinePatch]];
+        [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                 stageAtIndex:0
+                                                     progress:-1.0
+                                                      message:[NSString stringWithFormat:localize(@"i18n_str_930", nil), optiFineType, optiFinePatch]];
         NSString *downloadURL = [NSString stringWithFormat:@"https://bmclapi2.bangbang93.com/optifine/%@/%@/%@", gameVersion, optiFineType, optiFinePatch];
         NSURL *dlURL = [NSURL URLWithString:downloadURL];
         NSError *downloadError = nil;
@@ -1757,11 +1861,11 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:downloadError ?: [NSError errorWithDomain:@"OptiFine" code:2 userInfo:@{NSLocalizedDescriptionKey: @"下载失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"下载 OptiFine 失败：%@", downloadError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = downloadError ?: [NSError errorWithDomain:@"OptiFine" code:2 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_448", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_931", nil), downloadError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
             });
             return;
         }
@@ -1775,11 +1879,11 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:[NSError errorWithDomain:@"OptiFine" code:4 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"未找到原版 %@ 的版本信息", gameVersion]}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"未找到原版 %@ 的版本信息。\n\n请先在下载页面安装原版 %@，然后再安装 OptiFine。", gameVersion, gameVersion]];
-                });
+                NSError *failError = [NSError errorWithDomain:@"OptiFine" code:4 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_933", nil), gameVersion]}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_934", nil), gameVersion, gameVersion]];
             });
             return;
         }
@@ -1798,11 +1902,11 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:writeJarError ?: [NSError errorWithDomain:@"OptiFine" code:5 userInfo:@{NSLocalizedDescriptionKey: @"写入 jar 失败"}]];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"写入 OptiFine jar 失败：%@", writeJarError.localizedDescription ?: @"未知错误"]];
-                });
+                NSError *failError = writeJarError ?: [NSError errorWithDomain:@"OptiFine" code:5 userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_935", nil)}];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:failError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_936", nil), writeJarError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
             });
             return;
         }
@@ -1841,11 +1945,10 @@
             dispatch_async(dispatch_get_main_queue(), ^{
                 __strong typeof(weakSelf) strongSelf2 = weakSelf;
                 if (!strongSelf2) return;
-                [progress failWithError:writeJsonError];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                    [progress dismiss];
-                    [strongSelf2 showComponentAlert:@"安装失败" message:[NSString stringWithFormat:@"写入版本 JSON 失败：%@", writeJsonError.localizedDescription ?: @"未知错误"]];
-                });
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusFailed];
+                [[DownloadTaskManager sharedManager] updateTaskWithId:taskId error:writeJsonError];
+                [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateFailed];
+                [strongSelf2 showComponentAlert:localize(@"i18n_str_918", nil) message:[NSString stringWithFormat:localize(@"i18n_str_937", nil), writeJsonError.localizedDescription ?: localize(@"i18n_str_97", nil)]];
             });
             return;
         }
@@ -1866,20 +1969,22 @@
 
             [[NSNotificationCenter defaultCenter] postNotificationName:@"ReloadProfileList" object:nil];
 
-            [progress completeWithTitle:@"OptiFine 安装完成"];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [progress dismiss];
-                [strongSelf2 showComponentAlert:@"安装成功"
-                                         message:[NSString stringWithFormat:
-                                                  @"OptiFine %@ %@ 已安装为独立版本\n\n版本 ID：%@\n\n已自动切换到该版本，可直接启动游戏。",
-                                                  optiFineType, optiFinePatch, versionId]];
-            });
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskId
+                                                      stageAtIndex:0
+                                                           progress:1.0
+                                                           message:[NSString stringWithFormat:localize(@"i18n_str_938", nil), versionId]];
+            [[DownloadTaskManager sharedManager] updateTaskWithId:taskId stageAtIndex:0 status:PLTaskStageStatusCompleted];
+            [[DownloadTaskManager sharedManager] setTaskWithId:taskId state:DownloadTaskStateCompleted];
+            [strongSelf2 showComponentAlert:localize(@"i18n_str_253", nil)
+                                     message:[NSString stringWithFormat:
+                                              localize(@"i18n_str_939", nil),
+                                              optiFineType, optiFinePatch, versionId]];
         });
     });
 }
 
 - (void)showRendererSelector {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"选择渲染器"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_940", nil)
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
@@ -1898,7 +2003,7 @@
         }]];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         UITableViewCell *cell = [self cellForGlobalSection:3 row:0];
@@ -1934,19 +2039,19 @@
 
 /// 图形 API 显示名
 - (NSString *)graphicsApiDisplayName:(NSString *)api {
-    if ([api isEqualToString:@"prefer_vulkan"]) return @"优先 Vulkan";
-    if ([api isEqualToString:@"prefer_opengl"]) return @"优先 OpenGL";
-    return @"默认";
+    if ([api isEqualToString:@"prefer_vulkan"]) return localize(@"i18n_str_941", nil);
+    if ([api isEqualToString:@"prefer_opengl"]) return localize(@"i18n_str_942", nil);
+    return localize(@"i18n_str_943", nil);
 }
 
 /// 图形 API 选择器（MC 26.2+ 专用）
 - (void)showGraphicsApiSelector {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"选择图形 API"
-                                                                   message:@"MC 26.2+ 游戏内 OpenGL/Vulkan 切换"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_944", nil)
+                                                                   message:localize(@"i18n_str_945", nil)
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray *keys = @[@"default", @"prefer_vulkan", @"prefer_opengl"];
-    NSArray *names = @[@"默认", @"优先 Vulkan", @"优先 OpenGL"];
+    NSArray *names = @[localize(@"i18n_str_943", nil), localize(@"i18n_str_941", nil), localize(@"i18n_str_942", nil)];
 
     for (NSInteger i = 0; i < keys.count; i++) {
         NSString *key = keys[i];
@@ -1960,7 +2065,7 @@
         }]];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         UITableViewCell *cell = [self cellForGlobalSection:3 row:1];
@@ -1972,7 +2077,7 @@
 }
 
 - (void)showJavaVersionSelector {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"选择Java版本"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_946", nil)
                                                                    message:nil
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
@@ -1989,7 +2094,7 @@
     [versions insertObject:@"0" atIndex:0];
 
     for (NSString *ver in versions) {
-        NSString *name = [ver isEqualToString:@"0"] ? @"自动选择" : [NSString stringWithFormat:@"Java %@", ver];
+        NSString *name = [ver isEqualToString:@"0"] ? localize(@"preference.auto_select", nil) : [NSString stringWithFormat:@"Java %@", ver];
         [alert addAction:[UIAlertAction actionWithTitle:name
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(UIAlertAction * _Nonnull action) {
@@ -1999,7 +2104,7 @@
         }]];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         UITableViewCell *cell = [self cellForGlobalSection:3 row:1];
@@ -2018,8 +2123,8 @@
         [options addObject:@(mem)];
     }
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"分配内存"
-                                                                   message:[NSString stringWithFormat:@"设备总内存: %ld MB\n最大可分配: %ld MB", (long)(self.maxMemory / 0.8), (long)self.maxMemory]
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:localize(@"i18n_str_948", nil)
+                                                                   message:[NSString stringWithFormat:localize(@"i18n_str_949", nil), (long)(self.maxMemory / 0.8), (long)self.maxMemory]
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     for (NSNumber *memNum in options) {
@@ -2034,7 +2139,7 @@
         }]];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"resman.common.cancel", nil) style:UIAlertActionStyleCancel handler:nil]];
 
     if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         UITableViewCell *cell = [self cellForGlobalSection:3 row:2];
@@ -2078,7 +2183,7 @@
         // 名称变了，检查新名是否已存在
         if (PLProfiles.current.profiles[newName]) {
             // 重名，提示并取消
-            showDialog(@"错误", @"已存在同名版本配置，请使用其他名称");
+            showDialog(localize(@"i18n_str_42", nil), localize(@"i18n_str_1289", nil));
             return;
         }
         // 删除旧名，添加新名

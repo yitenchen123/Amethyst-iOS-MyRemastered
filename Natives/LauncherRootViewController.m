@@ -22,6 +22,8 @@
 // #import "TerracottaManager.h"
 // #import "TerracottaBridge.h"
 #import "AccountListViewController.h"
+#import "AI/AIViewController.h"
+#import "AI/AiSessionStore.h"
 
 // 布局常量（iPad 基准值；iPhone 上通过 LauncherRootLayoutWidth 适配后会变窄）
 static const CGFloat kSidebarWidthPad = 70.0;      // iPad 左侧边栏宽度
@@ -334,6 +336,11 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
                                              selector:@selector(showSettings)
                                                  name:@"ShowSettings"
                                                object:nil];
+    // 监听显示 AI 助手页面
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(showAIPage)
+                                                 name:@"ShowAIPage"
+                                               object:nil];
     // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
     // [[NSNotificationCenter defaultCenter] addObserver:self
     //                                          selector:@selector(showMultiplayer)
@@ -484,6 +491,15 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     [self setContentViewController:navVC animated:YES];
 }
 
+- (void)showAIPage {
+    // 从 AiSessionStore 取最近会话，没有则让 AIViewController 新建一个
+    AiSession *session = [[AiSessionStore sharedStore] lastActiveSession];
+    AIViewController *vc = [[AIViewController alloc] initWithSession:session];
+    UINavigationController *navVC = [[UINavigationController alloc] initWithRootViewController:vc];
+    navVC.navigationBar.prefersLargeTitles = NO;
+    [self setContentViewController:navVC animated:YES];
+}
+
 // ZeroTier/Terracotta 联机暂时移除（排查启动崩溃）
 // - (void)showMultiplayer { ... TerracottaViewController ... }
 // - (void)showZeroTier { ... MultiplayerViewController ... TerracottaManager ... }
@@ -495,10 +511,10 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
 }
 - (void)showMultiplayerDisabledAlert {
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:@"联机功能暂时不可用"
-                          message:@"联机模块（ZeroTier/Terracotta）正在排查启动崩溃问题，暂时禁用，请等待后续版本恢复。"
+        alertControllerWithTitle:localize(@"i18n_str_320", nil)
+                          message:localize(@"i18n_str_321", nil)
                    preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:localize(@"i18n_str_322", nil) style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -513,7 +529,6 @@ static CGFloat LauncherRootLayoutRightPanelWidth(UITraitCollection *trait) {
     UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vm];
     nav.navigationBar.prefersLargeTitles = NO;
     ModsManagerViewController *m = [[ModsManagerViewController alloc] init];
-    m.initialMode = ModsManagerModeLocal;
     [nav pushViewController:m animated:NO];
     [self setContentViewController:nav animated:YES];
 }
