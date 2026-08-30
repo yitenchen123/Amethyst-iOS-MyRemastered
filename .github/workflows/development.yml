@@ -29,6 +29,10 @@ jobs:
 
     runs-on: macos-14
 
+    # 发布 nightly release 需要 contents: write
+    permissions:
+      contents: write
+
     steps:
       - name: Select Xcode 15.4
         run: |
@@ -120,3 +124,29 @@ jobs:
         with:
           name: AngelAuraAmethyst.dSYM
           path: artifacts/AngelAuraAmethyst.dSYM
+
+      # 把产物发布到固定的 nightly release：artifact 下载链接只有 10 分钟有效，
+      # release asset 链接长期固定，便于挂代理/镜像加速（国内直连 GitHub 很慢）。
+      # 每次先删除同名 release，保证始终只有一个 nightly、链接地址不变。
+      - name: Publish nightly release
+        if: matrix.platform_name == 'ios' && success() && github.event_name == 'push' && github.ref == 'refs/heads/feat/sdl3'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="nightly-sdl3"
+          SHORT=$(git rev-parse --short HEAD)
+          IPA=$(ls artifacts/com.air-devs.air-*-ios.ipa 2>/dev/null | head -1 || true)
+          TIPA=$(ls artifacts/com.air-devs.air-*-ios-trollstore.tipa 2>/dev/null | head -1 || true)
+          if [ -z "$IPA" ]; then
+            echo "No ipa under artifacts/, skip release"
+            exit 0
+          fi
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          ASSETS=("$IPA")
+          if [ -n "$TIPA" ]; then ASSETS+=("$TIPA"); fi
+          gh release create "$TAG" \
+            --prerelease \
+            --title "Nightly (SDL3) @ ${SHORT}" \
+            --notes "自动构建：${{ github.ref_name }} @ ${SHORT}。链接长期固定，可用镜像加速下载。" \
+            "${ASSETS[@]}"
