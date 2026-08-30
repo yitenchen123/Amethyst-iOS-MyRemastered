@@ -141,8 +141,19 @@ public class PojavLauncher {
         MCOptionUtils.setDefault("particles", "1");
         MCOptionUtils.setDefault("renderDistance", "2");
         MCOptionUtils.setDefault("simulationDistance", "5");
+        // 关闭 OIT（Order-Independent Transparency）—— renderpearl 的
+        // oit_transmittance_flat_clouds Vulkan 管线在 MoltenVK / A11 GPU 上
+        // 编译失败导致崩溃。graphicsMode 0=Fast,1=Fancy,2=Fabulous(OIT)。
+        // 对齐 Ynnyny 仓库 be74cd4。
+        MCOptionUtils.setDefault("graphicsMode", "0");
+        MCOptionUtils.setDefault("transparency", "0");
         
         MCOptionUtils.save();
+
+        // 提示 renderpearl 跳过 OIT 管线编译
+        System.setProperty("com.mojang.renderpearl.disableOIT", "true");
+        System.setProperty("com.mojang.renderpearl.skipOIT", "true");
+        System.setProperty("com.mojang.renderpearl.forceNoOIT", "true");
 
         // Setup Forge splash.properties
         File forgeSplashFile = new File(Tools.DIR_GAME_NEW, "config/splash.properties");

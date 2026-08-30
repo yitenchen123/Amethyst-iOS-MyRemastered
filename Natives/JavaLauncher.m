@@ -1075,9 +1075,19 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     //
     // MC 26.3 起窗口与输入从 GLFW 迁到 SDL3，必须使用 3.4.1 —— 它带真正的
     // lwjgl-sdl.jar（加载真实 libSDL3），是 SDL3 输入注入的前提。
-    NSString *mcVersionId = [launchTarget isKindOfClass:NSString.class]
-        ? (NSString *)launchTarget
-        : PLProfiles.current.selectedProfile[@"lastVersionId"];
+    // MC 版本：优先用 launchTarget[@"id"]（实际启动的版本字典），
+    // 其次回落到当前 profile 的 lastVersionId。
+    // 注意 lastVersionId 可能是 "latest-release" 这类别名，直接拿来判断
+    // 主版本号会失败，所以 NSDictionary 分支优先用 id。
+    NSString *mcVersionId = nil;
+    if ([launchTarget isKindOfClass:NSDictionary.class]) {
+        mcVersionId = [launchTarget[@"id"] description];
+    } else if ([launchTarget isKindOfClass:NSString.class]) {
+        mcVersionId = (NSString *)launchTarget;
+    }
+    if (mcVersionId.length == 0) {
+        mcVersionId = [PLProfiles.current.selectedProfile[@"lastVersionId"] description];
+    }
     NSString *lwjglVersion = ResolveLwjglVersion(
         [PLProfiles resolveKeyForCurrentProfile:@"lwjglVersion"], mcVersionId);
     NSLog(@"[JavaLauncher] Using LWJGL %@ (mcVersion=%@)", lwjglVersion, mcVersionId);
