@@ -79,6 +79,13 @@ $(OUTPUTDIR)/lwjgl-%.jar: $(CLASSES) check_empty_classes
 	@echo "Creating $@"
 	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && $(BOOTJDK)/jar -xf "../../../lwjgl.jar" && rm -rf META-INF
+	# 仓库根 lwjgl.jar 里混入了 3 个用 JDK 25 编译的类（major 69）：
+	#   org/lwjgl/openal/SOFTSystemEvent{,s,ProcI}.class
+	# 它是"3.3.3 提供 3.4.1 API 兼容"的定制版，这 3 个类是从 3.4.1 一并塞进来的。
+	# 3.4.1 自带它们的 Java 8 版本，下一步解压后会被覆盖回来；但 3.3.3 没有这些
+	# 类，若保留 JDK 25 版本，Java 8 上的老版本 MC 一旦碰到就会抛
+	# UnsupportedClassVersionError。因此在叠加版本化 jar 之前先删掉。
+	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find org/lwjgl/openal -maxdepth 1 -name 'SOFTSystemEvent*.class' -delete 2>/dev/null || true
 	@cd $(OUTPUTDIR)/lwjgl_lib_$* && find ../../libs/lwjgl-$* -name 'lwjgl*.jar' -exec $(BOOTJDK)/jar -xf {} \; && rm -rf META-INF
 	@cp -R $(OUTPUTDIR)/lwjgl/* $(OUTPUTDIR)/lwjgl_lib_$*/
 	@mkdir -p $(OUTPUTDIR)/lwjgl_lib_$*/com/apple/ios/audio
