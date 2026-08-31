@@ -873,6 +873,123 @@ JNIEXPORT void JNICALL Java_org_lwjgl_glfw_CallbackBridge_nativeSendCursorEnter(
     }
 }
 */
+
+// ============================================================================
+// grab 状态同步（MC 26.3 / SDL3）
+//
+// MC 26.3 改用 SDL3 后不再调用 glfwSetInputMode，于是 CallbackBridge_nativeSetGrabbing
+// 与 pojavPumpEvents 都不会被触发，isGrabbing 只能从 SDL 侧同步。
+//
+// 原先只靠 CallbackBridge_nativeSendCursorPos 里的轮询，而它有两个致命缺陷：
+//   1. 必须由触摸事件驱动 —— 进世界后玩家不碰屏幕就永远同步不了
+//   2. 若 MC 根本不启用 SDL relative mouse mode，轮询结果恒为 false
+// 实测日志中 isGrabbing 全程为 0，正是这条链路断了。
+//
+// isGrabbing 直接决定游戏内物品栏能否点击：
+//   callback_SurfaceViewController_touchHotbar() 首行即 `if (isGrabbing == JNI_FALSE) return -1;`
+// 同时 guiScale 也只有在本函数里才会刷新，而 mcscale() 用它计算物品栏命中区域；
+// guiScale 卡在初始值 1 会让区域缩小到约 60x6 像素，等于点不中。
+// 两者任一失效都会表现为"hotbar 点不动"，即上游 issue 里反馈的那个现象。
+//
+// 调用方：
+//   1. main_hook.m 的 hooked_dlsym 拦截 SDL_SetWindowRelativeMouseMode（主路径）
+//   2. CallbackBridge_nativeSendCursorPos 的轮询（兜底）
+//
+// 注意这里可能在任意线程被调用（渲染线程 / UI 主线程），因此 JNI 调用必须
+// 获取本线程自己的 JNIEnv，不能复用 runtimeJNIEnvPtr。
+// ============================================================================
+void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source) {
+    static BOOL lastRelMode = NO;
+    static BOOL haveLast = NO;
+
+    if (haveLast && relMode == lastRelMode) return;
+    haveLast = YES;
+    lastRelMode = relMode;
+
+    BOOL wasGrabbing = isGrabbing;
+    isGrabbing = relMode;
+    NSLog(@"[InputDiag] grab state -> %d (was %d, source=%s)",
+          relMode, wasGrabbing, source ? source : "?");
+
+    // 进入抓取时补发一次左键释放：菜单里那次 ACTION_DOWN 否则永远不会抬起
+    if (!wasGrabbing && relMode) {
+        pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
+        NSLog(@"[InputDiag] Released stale mouse button on grab enter");
+    }
+
+    // 光标显隐
+    typedef bool (*VoidFunc)(void);
+    static VoidFunc hideCursor = NULL;
+    static VoidFunc showCursor = NULL;
+    if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
+    if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
+    if (relMode && hideCursor) hideCursor();
+    else if (!relMode && showCursor) showCursor();
+
+    // 刷新 guiScale（物品栏命中判定依赖它）。
+    // MC 26.3 走 SDL 时 glfwSetInputMode 不会被调用，guiScale 不会自动更新。
+    //
+    // 不加 isInputReady 判断：26.3 下 pojavPumpEvents 从不执行，isInputReady 恒为 NO，
+    // 加了会让这里永远跳过。
+    JNIEnv *scaleEnv = NULL;
+    BOOL scaleDidAttach = NO;
+    if (runtimeJavaVMPtr != NULL) {
+        if ((*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&scaleEnv, JNI_VERSION_1_4) != JNI_OK || scaleEnv == NULL) {
+            scaleEnv = NULL;
+            if ((*runtimeJavaVMPtr)->AttachCurrentThread(runtimeJavaVMPtr, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
+                scaleDidAttach = YES;
+            } else {
+                scaleEnv = NULL;
+            }
+        }
+    }
+    if (scaleEnv != NULL) {
+        @try {
+            jclass uikitClass = (*scaleEnv)->FindClass(scaleEnv, "net/kdt/pojavlaunch/uikit/UIKit");
+            if (uikitClass == NULL) {
+                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) (*scaleEnv)->ExceptionClear(scaleEnv);
+                NSLog(@"[InputDiag] updateMCGuiScale: UIKit class not found");
+            } else {
+                jmethodID updateScale = (*scaleEnv)->GetStaticMethodID(scaleEnv, uikitClass, "updateMCGuiScale", "()V");
+                if (updateScale == NULL) {
+                    if ((*scaleEnv)->ExceptionCheck(scaleEnv)) (*scaleEnv)->ExceptionClear(scaleEnv);
+                    NSLog(@"[InputDiag] updateMCGuiScale: method not found");
+                } else {
+                    (*scaleEnv)->CallStaticVoidMethod(scaleEnv, uikitClass, updateScale);
+                    if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
+                        (*scaleEnv)->ExceptionDescribe(scaleEnv);
+                        (*scaleEnv)->ExceptionClear(scaleEnv);
+                    } else {
+                        NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
+                    }
+                }
+                (*scaleEnv)->DeleteLocalRef(scaleEnv, uikitClass);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
+        }
+        if (scaleDidAttach) {
+            (*runtimeJavaVMPtr)->DetachCurrentThread(runtimeJavaVMPtr);
+        }
+    } else {
+        NSLog(@"[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread");
+    }
+
+    // UI 侧（虚拟鼠标指针等）切回主线程刷新
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
+            if (vc) {
+                [vc updateGrabState];
+            } else {
+                NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil");
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[InputDiag] updateGrabState exception: %@", e);
+        }
+    });
+}
+
 void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
     static int cursorSendCount = 0;
     cursorSendCount++;
@@ -883,122 +1000,21 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
     }
 
     // Sync isGrabbing from SDL's relative mouse mode (MC 26.3 uses SDL, not GLFW).
-    // When MC enters first-person, it calls SDL_SetWindowRelativeMouseMode(true).
-    // We poll this state to know when to send relative vs absolute motion.
+    //
+    // 主同步路径已移到 main_hook.m —— 那里通过 hooked_dlsym 拦截 MC 对
+    // SDL_SetWindowRelativeMouseMode 的调用，MC 一切换立即同步，不要求玩家先触摸。
+    // 这里保留轮询仅作兜底（例如 MC 改用其它 API 设置该状态时）。
     if (g_sdlWindow) {
         typedef bool (*GetRelModeFunc)(void*);
         static GetRelModeFunc getRelMode = NULL;
         static bool cursorFuncsInited = NO;
-        static bool lastRelMode = false;
         if (!cursorFuncsInited) {
             getRelMode = (GetRelModeFunc)dlsym(RTLD_DEFAULT, "SDL_GetWindowRelativeMouseMode");
             cursorFuncsInited = YES;
+            NSLog(@"[InputDiag] SDL_GetWindowRelativeMouseMode resolved: %p", (void *)getRelMode);
         }
         if (getRelMode) {
-            bool relMode = getRelMode(g_sdlWindow);
-            if (relMode != lastRelMode) {
-                lastRelMode = relMode;
-                BOOL wasGrabbing = isGrabbing;
-                isGrabbing = relMode;
-
-                // When entering grab mode, release any held mouse button
-                // (the ACTION_DOWN from the menu touch is never released otherwise)
-                if (!wasGrabbing && relMode) {
-                    pushSDLMouseButton(1, false, (float)cursorX, (float)cursorY);
-                    NSLog(@"[InputDiag] Released stale mouse button on grab enter");
-                }
-
-                // Update cursor visibility via SDL
-                typedef bool (*VoidFunc)(void);
-                static VoidFunc hideCursor = NULL;
-                static VoidFunc showCursor = NULL;
-                if (!hideCursor) hideCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_HideCursor");
-                if (!showCursor) showCursor = (VoidFunc)dlsym(RTLD_DEFAULT, "SDL_ShowCursor");
-                if (relMode && hideCursor) hideCursor();
-                else if (!relMode && showCursor) showCursor();
-
-                // MC 26.3 uses SDL, not GLFW. glfwSetInputMode is never called,
-                // so guiScale stays at 1. Call updateMCGuiScale to fix hotbar detection.
-                //
-                // CRASH FIX: this block used to call JNI through runtimeJNIEnvPtr,
-                // which is captured in JNI_OnLoad and therefore belongs to the JVM
-                // thread. But CallbackBridge_nativeSendCursorPos is driven by touch
-                // events from SurfaceViewController, i.e. it runs on the UI main
-                // thread. JNIEnv* is thread-local, so dereferencing another thread's
-                // JNIEnv is undefined behaviour and reproducibly SIGSEGVs inside
-                // FindClass the first time MC grabs the mouse (entering a world).
-                //
-                // The @try/@catch below cannot help with that: SIGSEGV is a Unix
-                // signal, not an NSException, so it is never caught here. The only
-                // correct fix is to obtain a JNIEnv for the *current* thread.
-                //
-                // NOTE: no isInputReady guard here on purpose. With MC 26.3 the game
-                // pumps SDL events, so glfwPollEvents/pojavPumpEvents never runs and
-                // isInputReady stays NO; gating on it would skip this call forever.
-                JNIEnv *scaleEnv = NULL;
-                BOOL scaleDidAttach = NO;
-                if (runtimeJavaVMPtr != NULL) {
-                    if ((*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&scaleEnv, JNI_VERSION_1_4) != JNI_OK || scaleEnv == NULL) {
-                        scaleEnv = NULL;
-                        if ((*runtimeJavaVMPtr)->AttachCurrentThread(runtimeJavaVMPtr, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
-                            scaleDidAttach = YES;
-                        } else {
-                            scaleEnv = NULL;
-                        }
-                    }
-                }
-                if (scaleEnv != NULL) {
-                    @try {
-                        jclass uikitClass = (*scaleEnv)->FindClass(scaleEnv, "net/kdt/pojavlaunch/uikit/UIKit");
-                        if (uikitClass == NULL) {
-                            if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
-                                (*scaleEnv)->ExceptionClear(scaleEnv);
-                            }
-                            NSLog(@"[InputDiag] updateMCGuiScale: UIKit class not found");
-                        } else {
-                            jmethodID updateScale = (*scaleEnv)->GetStaticMethodID(scaleEnv, uikitClass, "updateMCGuiScale", "()V");
-                            if (updateScale == NULL) {
-                                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
-                                    (*scaleEnv)->ExceptionClear(scaleEnv);
-                                }
-                                NSLog(@"[InputDiag] updateMCGuiScale: method not found");
-                            } else {
-                                (*scaleEnv)->CallStaticVoidMethod(scaleEnv, uikitClass, updateScale);
-                                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
-                                    (*scaleEnv)->ExceptionDescribe(scaleEnv);
-                                    (*scaleEnv)->ExceptionClear(scaleEnv);
-                                } else {
-                                    NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
-                                }
-                            }
-                            (*scaleEnv)->DeleteLocalRef(scaleEnv, uikitClass);
-                        }
-                    } @catch (NSException *e) {
-                        NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
-                    }
-                    if (scaleDidAttach) {
-                        (*runtimeJavaVMPtr)->DetachCurrentThread(runtimeJavaVMPtr);
-                    }
-                } else {
-                    NSLog(@"[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread");
-                }
-
-                // Update UIKit mousePointerView visibility on main thread
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    @try {
-                        SurfaceViewController *vc = (SurfaceViewController *)UIWindow.mainWindow.rootViewController;
-                        if (vc) {
-                            [vc updateGrabState];
-                        } else {
-                            NSLog(@"[InputDiag] updateGrabState: UIWindow.mainWindow is nil");
-                        }
-                    } @catch (NSException *e) {
-                        NSLog(@"[InputDiag] updateGrabState exception: %@", e);
-                    }
-                });
-
-                NSLog(@"[InputDiag] isGrabbing synced from SDL: %d", isGrabbing);
-            }
+            CallbackBridge_syncGrabStateFromSDL(getRelMode(g_sdlWindow), "poll");
         }
     }
 

@@ -18,6 +18,26 @@ void (*orig_abort)();
 void (*orig_exit)(int code);
 void* (*orig_dlopen)(const char* path, int mode);
 void* (*orig_dlsym)(void* handle, const char* name);
+
+// MARK: - SDL3 grab 状态同步（MC 26.3）
+//
+// input_bridge_v3.m 提供统一的抓取状态同步入口。MC 26.3 改用 SDL3 后不再
+// 调用 glfwSetInputMode，Amethyst 原先只能靠触摸事件轮询 SDL 的 relative
+// mouse mode 来同步 isGrabbing，而这条链路实测失效（日志中 isGrabbing 恒为 0），
+// 导致游戏内物品栏点不动。这里改为直接拦截 MC 的设置调用。
+extern void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source);
+
+static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
+
+static bool amethyst_SDL_SetWindowRelativeMouseMode(void *window, bool enabled) {
+    // 先让 Amethyst 侧同步（isGrabbing / guiScale / 光标显隐），再交给真正的 SDL。
+    // 包装内部已有"状态未变化则跳过"的判断，重复调用无副作用。
+    CallbackBridge_syncGrabStateFromSDL(enabled ? YES : NO, "SetWindowRelativeMouseMode");
+    if (g_real_SDL_SetWindowRelativeMouseMode) {
+        return g_real_SDL_SetWindowRelativeMouseMode(window, enabled);
+    }
+    return false;
+}
 int (*orig_open)(const char *path, int oflag, ...);
 
 /// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
@@ -1096,6 +1116,23 @@ void rebindZinkStrideFixForNewImage(void) {
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
 void* hooked_dlsym(void* handle, const char* name) {
+    // MC 26.3 用 SDL3，通过 SDL_SetWindowRelativeMouseMode 切换抓取状态。
+    // LWJGL 是 dlsym 取函数指针后直接调用（不走 __la_symbol_ptr，fishhook 拦不住），
+    // 所以必须在这里拦截。这样 MC 一调用就同步，不再依赖触摸轮询。
+    if (name != NULL && strcmp(name, "SDL_SetWindowRelativeMouseMode") == 0) {
+        if (!g_real_SDL_SetWindowRelativeMouseMode) {
+            g_real_SDL_SetWindowRelativeMouseMode = (bool (*)(void *, bool))orig_dlsym(handle, name);
+        }
+        NSLog(@"[InputDiag] dlsym intercepted: SDL_SetWindowRelativeMouseMode -> hook (real=%p)",
+              (void *)g_real_SDL_SetWindowRelativeMouseMode);
+        return (void *)amethyst_SDL_SetWindowRelativeMouseMode;
+    }
+    // 诊断：记录 MC 查询了哪些其它 SDL 鼠标/抓取相关 API，便于判断它实际用了哪条路径
+    if (name != NULL && strncmp(name, "SDL_Set", 7) == 0 &&
+        (strstr(name, "Mouse") != NULL || strstr(name, "Relative") != NULL)) {
+        NSLog(@"[InputDiag] dlsym query: %s", name);
+    }
+
     if (name != NULL && g_zinkStrideFixActive) {
         if (strcmp(name, "vkGetInstanceProcAddr") == 0) {
             if (!g_real_vkGetInstanceProcAddr) {
