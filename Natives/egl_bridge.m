@@ -80,13 +80,46 @@ bool pojavIsActualVulkanPath() {
 }
 
 void JNI_LWJGL_changeRenderer(const char* value_c) {
-    JNIEnv *env;
-    (*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&env, JNI_VERSION_1_4);
+    if (value_c == NULL) return;
+
+    // 原实现直接 (*runtimeJavaVMPtr)->GetEnv(...) 且不检查返回值。
+    // 在非 JVM 线程上（SDL 的视频/事件线程，SDL3 路径的 SDL_GL_LoadLibrary 就发生在
+    // 这类线程上）GetEnv 返回 JNI_EDETACHED 并且**不会写 env**，env 保持为未初始化的
+    // 栈垃圾，紧接着 (*env)->NewStringUTF(...) 立刻段错误（崩溃点就是本函数 +0x1c）。
+    // 这里补齐：VM 判空 -> GetEnv 结果判空 -> AttachCurrentThread 兜底 -> 用完 detach。
+    JavaVM *vm = runtimeJavaVMPtr;
+    if (vm == NULL) {
+        NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: runtimeJavaVMPtr is NULL", value_c);
+        return;
+    }
+
+    JNIEnv *env = NULL;
+    BOOL attached = NO;
+    if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_4) != JNI_OK || env == NULL) {
+        if ((*vm)->AttachCurrentThread(vm, (void **)&env, NULL) != JNI_OK || env == NULL) {
+            NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: cannot obtain JNIEnv", value_c);
+            return;
+        }
+        attached = YES;
+    }
+
     jstring key = (*env)->NewStringUTF(env, "org.lwjgl.opengl.libname");
     jstring value = (*env)->NewStringUTF(env, value_c);
-    jclass clazz = (*env)->FindClass(env, "java/lang/System");
-    jmethodID method = (*env)->GetStaticMethodID(env, clazz, "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
-    (*env)->CallStaticObjectMethod(env, clazz, method, key, value);
+    if (key != NULL && value != NULL) {
+        jclass clazz = (*env)->FindClass(env, "java/lang/System");
+        if (clazz != NULL) {
+            jmethodID method = (*env)->GetStaticMethodID(env, clazz, "setProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+            if (method != NULL) {
+                (*env)->CallStaticObjectMethod(env, clazz, method, key, value);
+            }
+            (*env)->DeleteLocalRef(env, clazz);
+        }
+        (*env)->DeleteLocalRef(env, key);
+        (*env)->DeleteLocalRef(env, value);
+    }
+
+    if (attached) (*vm)->DetachCurrentThread(vm);
 }
 
 void pojavTerminate() {
@@ -106,7 +139,7 @@ int pojavInit(BOOL useStackQueue) {
     return JNI_TRUE;
 }
 
-int pojavInitOpenGL() {
+static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
     NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
     BOOL isAuto = [renderer isEqualToString:@"auto"];
     if (isAuto || [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
@@ -189,7 +222,7 @@ int pojavInitOpenGL() {
         // Vulkan 模式下 LWJGL OpenGL 库使用 MobileGlues（由 JavaLauncher.m 设置）
         // 不再调用 JNI_LWJGL_changeRenderer(RENDERER_NAME_MTL_ANGLE)，
         // 因为 JavaLauncher.m 已通过 -Dorg.lwjgl.opengl.libname=libmobileglues.dylib 设置
-        JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
+        if (setLwjglProperty) JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
         return !br_init();
     }
@@ -198,7 +231,7 @@ int pojavInitOpenGL() {
         unsetenv("MOBILEGL_BACKEND_TYPE");
         unsetenv("MOBILEGL_LOG_FILE_PATH");
     }
-    if (strcmp(renderer.UTF8String, RENDERER_NAME_VULKAN) != 0) {
+    if (setLwjglProperty && strcmp(renderer.UTF8String, RENDERER_NAME_VULKAN) != 0) {
         JNI_LWJGL_changeRenderer(renderer.UTF8String);
     }
     // Preload renderer library
@@ -206,6 +239,20 @@ int pojavInitOpenGL() {
 
     return !br_init();
     //return 0;
+}
+
+int pojavInitOpenGL(void) {
+    return pojavInitOpenGLInternal(YES);
+}
+
+/// SDL3 路径专用入口：不写 org.lwjgl.opengl.libname。
+///
+/// 该属性由 JavaLauncher 在 JVM 启动时以 -D 传入，LWJGL 在 bootstrap 阶段就已读取
+/// 并 dlopen 了渲染器库（这正是 MC 26.3 报 "OpenGL library already loaded" 的来源）。
+/// 等到 SDL_GL_LoadLibrary 再设这个属性既无效果（LWJGL 的 System property 只在类
+/// 初始化时读一次），又要为此把非 JVM 线程 attach 到 VM，属于纯粹的收益为负的操作。
+int pojavInitOpenGLForSDL3(void) {
+    return pojavInitOpenGLInternal(NO);
 }
 
 void pojavSetWindowHint(int hint, int value) {
