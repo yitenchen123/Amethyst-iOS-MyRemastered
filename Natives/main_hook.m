@@ -27,6 +27,13 @@ void* (*orig_dlsym)(void* handle, const char* name);
 // 导致游戏内物品栏点不动。这里改为直接拦截 MC 的设置调用。
 extern void CallbackBridge_syncGrabStateFromSDL(BOOL relMode, const char *source);
 
+// MARK: - SDL3 兼容层（移植自 ZalithLauncher2）
+//
+// Android 端 ZL2 用 bytehook 注入 libSDL3.so；iOS 上没有 bytehook，等价位置
+// 就是本文件的 hooked_dlsym —— LWJGL 通过 dlsym 取指针后直接调用，必须在
+// dlsym 层拦截。返回非 NULL 表示该符号被兼容层接管。
+extern void *amethyst_sdl3_hook_resolve(void *handle, const char *name);
+
 static bool (*g_real_SDL_SetWindowRelativeMouseMode)(void *window, bool enabled) = NULL;
 
 static bool amethyst_SDL_SetWindowRelativeMouseMode(void *window, bool enabled) {
@@ -1196,6 +1203,12 @@ void rebindZinkStrideFixForNewImage(void) {
 ///
 /// 其他函数正常返回 orig_dlsym 的结果，避免日志爆炸。
 void* hooked_dlsym(void* handle, const char* name) {
+    // SDL3 兼容层：建窗前强制 ES profile、主窗口复用、EGL 兼容重试、
+    // Vulkan loader 句柄共享。返回非 NULL 表示已接管该符号。
+    {
+        void *ame_p = amethyst_sdl3_hook_resolve(handle, name);
+        if (ame_p != NULL) return ame_p;
+    }
     // MC 26.3 用 SDL3，通过 SDL_SetWindowRelativeMouseMode 切换抓取状态。
     // LWJGL 是 dlsym 取函数指针后直接调用（不走 __la_symbol_ptr，fishhook 拦不住），
     // 所以必须在这里拦截。这样 MC 一调用就同步，不再依赖触摸轮询。
