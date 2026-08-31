@@ -919,20 +919,68 @@ void CallbackBridge_nativeSendCursorPos(char event, CGFloat x, CGFloat y) {
 
                 // MC 26.3 uses SDL, not GLFW. glfwSetInputMode is never called,
                 // so guiScale stays at 1. Call updateMCGuiScale to fix hotbar detection.
-                // Must call on JVM-attached thread (not main thread) — runtimeJNIEnvPtr
-                // belongs to the JVM thread; using it from main thread causes SIGSEGV.
-                @try {
-                    jclass uikitClass = (*runtimeJNIEnvPtr)->FindClass(runtimeJNIEnvPtr, "net/kdt/pojavlaunch/uikit/UIKit");
-                    if (uikitClass) {
-                        jmethodID updateScale = (*runtimeJNIEnvPtr)->GetStaticMethodID(runtimeJNIEnvPtr, uikitClass, "updateMCGuiScale", "()V");
-                        if (updateScale) {
-                            (*runtimeJNIEnvPtr)->CallStaticVoidMethod(runtimeJNIEnvPtr, uikitClass, updateScale);
-                            NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
+                //
+                // CRASH FIX: this block used to call JNI through runtimeJNIEnvPtr,
+                // which is captured in JNI_OnLoad and therefore belongs to the JVM
+                // thread. But CallbackBridge_nativeSendCursorPos is driven by touch
+                // events from SurfaceViewController, i.e. it runs on the UI main
+                // thread. JNIEnv* is thread-local, so dereferencing another thread's
+                // JNIEnv is undefined behaviour and reproducibly SIGSEGVs inside
+                // FindClass the first time MC grabs the mouse (entering a world).
+                //
+                // The @try/@catch below cannot help with that: SIGSEGV is a Unix
+                // signal, not an NSException, so it is never caught here. The only
+                // correct fix is to obtain a JNIEnv for the *current* thread.
+                //
+                // NOTE: no isInputReady guard here on purpose. With MC 26.3 the game
+                // pumps SDL events, so glfwPollEvents/pojavPumpEvents never runs and
+                // isInputReady stays NO; gating on it would skip this call forever.
+                JNIEnv *scaleEnv = NULL;
+                BOOL scaleDidAttach = NO;
+                if (runtimeJavaVMPtr != NULL) {
+                    if ((*runtimeJavaVMPtr)->GetEnv(runtimeJavaVMPtr, (void **)&scaleEnv, JNI_VERSION_1_4) != JNI_OK || scaleEnv == NULL) {
+                        scaleEnv = NULL;
+                        if ((*runtimeJavaVMPtr)->AttachCurrentThread(runtimeJavaVMPtr, &scaleEnv, NULL) == JNI_OK && scaleEnv != NULL) {
+                            scaleDidAttach = YES;
+                        } else {
+                            scaleEnv = NULL;
                         }
-                        (*runtimeJNIEnvPtr)->DeleteLocalRef(runtimeJNIEnvPtr, uikitClass);
                     }
-                } @catch (NSException *e) {
-                    NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
+                }
+                if (scaleEnv != NULL) {
+                    @try {
+                        jclass uikitClass = (*scaleEnv)->FindClass(scaleEnv, "net/kdt/pojavlaunch/uikit/UIKit");
+                        if (uikitClass == NULL) {
+                            if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
+                                (*scaleEnv)->ExceptionClear(scaleEnv);
+                            }
+                            NSLog(@"[InputDiag] updateMCGuiScale: UIKit class not found");
+                        } else {
+                            jmethodID updateScale = (*scaleEnv)->GetStaticMethodID(scaleEnv, uikitClass, "updateMCGuiScale", "()V");
+                            if (updateScale == NULL) {
+                                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
+                                    (*scaleEnv)->ExceptionClear(scaleEnv);
+                                }
+                                NSLog(@"[InputDiag] updateMCGuiScale: method not found");
+                            } else {
+                                (*scaleEnv)->CallStaticVoidMethod(scaleEnv, uikitClass, updateScale);
+                                if ((*scaleEnv)->ExceptionCheck(scaleEnv)) {
+                                    (*scaleEnv)->ExceptionDescribe(scaleEnv);
+                                    (*scaleEnv)->ExceptionClear(scaleEnv);
+                                } else {
+                                    NSLog(@"[InputDiag] updateMCGuiScale called, guiScale=%d", guiScale);
+                                }
+                            }
+                            (*scaleEnv)->DeleteLocalRef(scaleEnv, uikitClass);
+                        }
+                    } @catch (NSException *e) {
+                        NSLog(@"[InputDiag] updateMCGuiScale exception: %@", e);
+                    }
+                    if (scaleDidAttach) {
+                        (*runtimeJavaVMPtr)->DetachCurrentThread(runtimeJavaVMPtr);
+                    }
+                } else {
+                    NSLog(@"[InputDiag] updateMCGuiScale skipped: no JNIEnv for this thread");
                 }
 
                 // Update UIKit mousePointerView visibility on main thread
