@@ -139,7 +139,38 @@ int pojavInit(BOOL useStackQueue) {
     return JNI_TRUE;
 }
 
+/// OpenGL 子系统是否已初始化成功（渲染器 bridge + br_init()）。
+///
+/// 必须是全局的而不是 pojavCreateContext 里的局部 static：SDL3 路径下
+/// SDL_GL_LoadLibrary 已经调过 pojavInitOpenGLForSDL3() 完成初始化，
+/// 若 pojavCreateContext 再凭自己的局部 static 判定"未初始化"，就会再调一次
+/// 完整的 pojavInitOpenGL()——那会在 SDL 的原生线程上执行 JNI 调用
+/// （JNI_LWJGL_changeRenderer），正是 fc0d838 上报的
+/// `C [AngelAuraAmethyst+0x220df8] JNI_LWJGL_changeRenderer+0x1c` 崩溃。
+static BOOL s_openGLInited = NO;
+
+BOOL pojavIsOpenGLInited(void) {
+    return s_openGLInited;
+}
+
+/// 统一收口初始化结果，成功后置位幂等标志。
+static int pojavFinishOpenGLInit(int result) {
+    if (result == 0) {
+        s_openGLInited = YES;
+    } else {
+        NSLog(@"[egl_bridge] pojavInitOpenGL failed (br_init() returned %d); "
+              @"not marking as initialised", result);
+    }
+    return result;
+}
+
 static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
+    if (s_openGLInited) {
+        // 幂等：重复初始化会二次 dlopen 渲染器、二次 br_init()（eglInitialize），
+        // 且在 SDL3 路径上会触发无意义的 JNI 调用。
+        NSDebugLog(@"[egl_bridge] pojavInitOpenGL skipped: already initialised");
+        return 0;
+    }
     NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
     BOOL isAuto = [renderer isEqualToString:@"auto"];
     if (isAuto || [renderer isEqualToString:@ RENDERER_NAME_GL4ES]) {
@@ -224,7 +255,7 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         // 因为 JavaLauncher.m 已通过 -Dorg.lwjgl.opengl.libname=libmobileglues.dylib 设置
         if (setLwjglProperty) JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
-        return !br_init();
+        return pojavFinishOpenGLInit(!br_init());
     }
     if (!isMobileGLRenderer(renderer.UTF8String)) {
         // 切换渲染器后清掉 MobileGL 专用环境变量，避免残留影响下一次启动
@@ -237,7 +268,7 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
     // Preload renderer library
     dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_GLOBAL);
 
-    return !br_init();
+    return pojavFinishOpenGLInit(!br_init());
     //return 0;
 }
 
@@ -298,9 +329,10 @@ void pojavMakeCurrent(basic_render_window_t* window) {
 }
 
 void* pojavCreateContext(basic_render_window_t* contextSrc) {
-    static BOOL inited = NO;
-    if (!inited) {
-        inited = YES;
+    // 用全局幂等标志而非局部 static：SDL3 路径下 SDL_GL_LoadLibrary 已通过
+    // pojavInitOpenGLForSDL3() 完成初始化，此处若用局部 static 判定为"未初始化"，
+    // 会再调一次完整的 pojavInitOpenGL()，在 SDL 的原生线程上触发 JNI 调用。
+    if (!pojavIsOpenGLInited()) {
         pojavInitOpenGL();
     }
 

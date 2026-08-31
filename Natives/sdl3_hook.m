@@ -512,6 +512,18 @@ static bool ame_SDL_GL_LoadLibrary(const char *path) {
 }
 
 static void *ame_SDL_GL_CreateContext(void *window) {
+    // MC 26.3 ss9+ 在设备初始化时先建一个隐藏工具窗口（flags 含 SDL_WINDOW_HIDDEN），
+    // 随后再建主窗口。而 EGL bridge 的上下文生命周期与进程一致
+    // （SDL_GL_DestroyContext 不真正销毁，见下），若每次调用都新建，就会在同一个
+    // CALayer 上叠加第二个 EGLSurface —— 部分 EGL 实现（含 MobileGL）会直接失败，
+    // 即便成功也会让 eglMakeCurrent 在两个 surface 间反复切换。
+    // 故复用首个上下文，与 ZL2 的 shouldReusePrimaryWindow() 同一思路。
+    if (g_glContext != NULL) {
+        NSDebugLog(@"[SDLHook] SDL_GL_CreateContext(%p) -> reuse existing %p", window, g_glContext);
+        // 复用时也要保证它处于 current 状态：MC 建完上下文后必然调 MakeCurrent，
+        // 这里不额外处理。
+        return g_glContext;
+    }
     void *ctx = pojavCreateContext(NULL);
     if (ctx != NULL) g_glContext = ctx;
     NSDebugLog(@"[SDLHook] SDL_GL_CreateContext(%p) -> %p (EGL bridge)", window, ctx);
