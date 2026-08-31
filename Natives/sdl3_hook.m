@@ -473,7 +473,9 @@ static bool ame_glBridgeEnabled(void) {
 
 // egl_bridge.m 的上下文入口。这些函数没有公开头文件，故在此 extern 声明。
 // 参数用 void* 以避开 basic_render_window_t 的类型依赖。
-extern int   pojavInitOpenGL(void);
+// SDL3 路径用 ForSDL3 变体：不写 org.lwjgl.opengl.libname（该属性由 JavaLauncher
+// 在 JVM 启动时以 -D 传入，LWJGL 早已读取；此处再设无效且需 attach 非 JVM 线程）。
+extern int   pojavInitOpenGLForSDL3(void);
 extern void *pojavCreateContext(void *contextSrc);
 extern void  pojavMakeCurrent(void *window);
 extern void  pojavSwapBuffers(void);
@@ -502,8 +504,8 @@ static void *ame_rendererHandle(void) {
 static bool ame_SDL_GL_LoadLibrary(const char *path) {
     if (!g_glBridgeInited) {
         g_glBridgeInited = true;
-        int r = pojavInitOpenGL();
-        NSDebugLog(@"[SDLHook] SDL_GL_LoadLibrary('%s') -> pojavInitOpenGL()=%d (EGL bridge)",
+        int r = pojavInitOpenGLForSDL3();
+        NSDebugLog(@"[SDLHook] SDL_GL_LoadLibrary('%s') -> pojavInitOpenGLForSDL3()=%d (EGL bridge)",
                    path ?: "<null>", r);
     }
     return true;
