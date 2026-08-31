@@ -106,9 +106,11 @@ POJAV_JRE21_DIR       ?= $(SOURCEDIR)/depends/java-21-openjdk
 POJAV_JRE25_DIR       ?= $(SOURCEDIR)/depends/java-25-openjdk
 MOLTENVK_LIBRARY      ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMoltenVK.dylib
 MOBILEGL_SOURCE_DIR   ?= $(SOURCEDIR)/Natives/external/MobileGL
-# MobileGL 默认不构建：其源码 + 递归子模块（DiligentCore/glslang/SPIRV-Cross 等）体积巨大，
-# 且上游尚无预编译产物，只能在构建时从源码编译，会显著拉长 CI 时间且易受上游改动影响。
-# 需要时用 BUILD_MOBILEGL=1 显式开启（源码目录必须已存在）。
+# MobileGL 源码已 vendoring 在 Natives/external/MobileGL（与 MobileGlues 一样是普通
+# 源码目录，不再是 gitlink），可以直接改源码调 iOS 构建。
+# 上游不发布 iOS 预编译产物，只能本地编译；编 glslang + SPIRV-Cross 很慢，
+# 故默认关闭，用 BUILD_MOBILEGL=1 显式开启（CI 上通过 repo variable 控制）。
+# 更新源码：Actions -> Vendor MobileGL sources -> Run workflow
 BUILD_MOBILEGL        ?= 0
 MITHRIL_PREBUILT_DIR  ?= $(SOURCEDIR)/prebuilt
 
@@ -337,7 +339,7 @@ dep_mg:
 
 dep_mobilegl:
 	@if [ '$(BUILD_MOBILEGL)' != '1' ]; then \
-		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build MobileGL from source)'; \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build from vendored source)'; \
 	elif [ ! -d "$(MOBILEGL_SOURCE_DIR)" ]; then \
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
 	else \

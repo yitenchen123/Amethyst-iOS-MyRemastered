@@ -98,41 +98,6 @@ jobs:
       #
       # Mithril 不需要下载步骤：libmithril.dylib 已提交在
       # Natives/resources/Frameworks/ 下，随 Natives/resources/* 一起打包。
-      - name: Fetch MobileGL source (optional)
-        env:
-          GIT_LFS_SKIP_SMUDGE: "1"
-          BUILD_MOBILEGL: ${{ vars.BUILD_MOBILEGL }}
-        run: |
-          set -eu
-          if [ "${BUILD_MOBILEGL:-0}" != "1" ]; then
-            echo "BUILD_MOBILEGL is not 1; skipping MobileGL source fetch"
-            exit 0
-          fi
-          rm -rf Natives/external/MobileGL
-          git clone --depth 1 https://github.com/MobileGL-Dev/MobileGL.git Natives/external/MobileGL
-          cd Natives/external/MobileGL
-          # MobileGL 的 CMakeLists 对下面这批是无条件 add_subdirectory()，缺任意一个
-          # configure 就会失败。apitrace / tracy 不参与 iOS 构建，跳过。
-          for m in 3rdparty/glslang \
-                   3rdparty/SPIRV-Cross \
-                   3rdparty/SPIRV-Reflect \
-                   3rdparty/Vulkan-Headers \
-                   3rdparty/VulkanMemoryAllocator \
-                   3rdparty/xxHash \
-                   3rdparty/asio \
-                   include/ska; do
-            git submodule update --init --depth 1 "$m" \
-              || echo "::warning::MobileGL submodule $m unavailable"
-          done
-          # Vulkan-Utility-Libraries 自带 Vulkan-Headers 子模块，必须 --recursive
-          git submodule update --init --depth 1 --recursive 3rdparty/Vulkan-Utility-Libraries \
-            || echo "::warning::MobileGL submodule Vulkan-Utility-Libraries unavailable"
-          # DiligentCore 本身不参与编译（CMakeLists 里 add_subdirectory 已注释），
-          # 只为 Makefile 的软链接提供 ThirdParty/SPIRV-Tools 与 SPIRV-Headers。
-          # 该仓库自身没有子模块，不需要 --recursive（省下大量 clone 时间）。
-          git submodule update --init --depth 1 3rdparty/DiligentCore \
-            || echo "::warning::MobileGL submodule DiligentCore unavailable"
-
       - name: Build for ${{ matrix.platform_name }}
         env:
           IPHONEOS_DEPLOYMENT_TARGET: 14.0
