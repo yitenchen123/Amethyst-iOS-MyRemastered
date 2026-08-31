@@ -89,23 +89,37 @@ jobs:
       #   - MobileGL needs cloning upstream sources, gated on repo variable BUILD_MOBILEGL
       # If either is missing, the renderer is simply hidden in Settings
       # (LauncherPreferences.m filters by dylib existence).
+      # 注意：不要在 `if:` 条件里引用 secrets / vars。
+      # GitHub Actions 的表达式求值器在编译 workflow 时处理这些 context，
+      # secrets 在 if: 中不受官方支持，vars 在仓库尚未创建任何 variable 时
+      # 求值也会失败 —— 两种情况都会让整个 workflow 编译失败，
+      # 表现为 run 直接 failure 且没有任何 job（jobs API total_count=0、
+      # 日志 404）。判断逻辑一律放进 shell，env: 里引用是安全的标准用法。
       - name: Fetch Mithril renderer (optional)
-        if: vars.MITHRIL_ARTIFACT_ID != '' && secrets.MITHRIL_FETCH_TOKEN != ''
         env:
-          GITHUB_TOKEN: ${{ secrets.MITHRIL_FETCH_TOKEN }}
-          ARTIFACT_ID: ${{ vars.MITHRIL_ARTIFACT_ID }}
+          MITHRIL_ARTIFACT_ID: ${{ vars.MITHRIL_ARTIFACT_ID }}
+          MITHRIL_FETCH_TOKEN: ${{ secrets.MITHRIL_FETCH_TOKEN }}
         run: |
           set -eu
-          sh scripts/fetch_mithril.sh || {
+          if [ -z "${MITHRIL_ARTIFACT_ID:-}" ] || [ -z "${MITHRIL_FETCH_TOKEN:-}" ]; then
+            echo "Mithril not configured (needs repo variable MITHRIL_ARTIFACT_ID + secret MITHRIL_FETCH_TOKEN); skipping"
+            exit 0
+          fi
+          GITHUB_TOKEN="$MITHRIL_FETCH_TOKEN" ARTIFACT_ID="$MITHRIL_ARTIFACT_ID" \
+            sh scripts/fetch_mithril.sh || {
             echo "::warning::Mithril download failed; this build has no Mithril renderer"
           }
 
       - name: Fetch MobileGL source (optional)
-        if: vars.BUILD_MOBILEGL == '1'
         env:
           GIT_LFS_SKIP_SMUDGE: "1"
+          BUILD_MOBILEGL: ${{ vars.BUILD_MOBILEGL }}
         run: |
           set -eu
+          if [ "${BUILD_MOBILEGL:-0}" != "1" ]; then
+            echo "BUILD_MOBILEGL is not 1; skipping MobileGL source fetch"
+            exit 0
+          fi
           rm -rf Natives/external/MobileGL
           git clone --depth 1 https://github.com/MobileGL-Dev/MobileGL.git Natives/external/MobileGL
           cd Natives/external/MobileGL
@@ -135,11 +149,16 @@ jobs:
         env:
           IPHONEOS_DEPLOYMENT_TARGET: 14.0
           CONFIG_CURSEFORGE_API_KEY: ${{ secrets.CONFIG_CURSEFORGE_API_KEY }}
+          # 供上面的 Fetch MobileGL source 与下面的 make 使用。
+          # 在 env: 里引用 vars 是官方支持的用法；不要写成
+          # `export BUILD_MOBILEGL=${{ vars.BUILD_MOBILEGL || '0' }}` 放进 run:，
+          # 那样仍会在 workflow 编译期求值 vars。
+          BUILD_MOBILEGL: ${{ vars.BUILD_MOBILEGL }}
         run: |
           set -o pipefail
           export PATH=/opt/homebrew/bin:$PATH
           export SLIMMED=0
-          export BUILD_MOBILEGL=${{ vars.BUILD_MOBILEGL || '0' }}
+          export BUILD_MOBILEGL="${BUILD_MOBILEGL:-0}"
 
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
