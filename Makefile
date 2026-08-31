@@ -404,6 +404,12 @@ dep_mobilegl_build:
 	# 走 make_unique 圆括号调用构造函数 Range1D(SizeT,SizeT)（int->size_t 普通转换）。
 	# Range1D/BufferChange 构造函数补丁必须保留：GL_Buffer.cpp 等仍用 Range1D(x,y) 圆括号
 	# 直接构造临时对象（不经 MakeUnique），若无构造函数则 C++17 聚合体圆括号语法不可用。
+	# DirectGLES 后端在 iOS 上的启动崩溃：
+	# ProbeTexture 无条件调用 glTexStorage*Multisample，
+	# 而“指针非空”不等于上下文支持
+	#（GLES 3.1+/3.2+），ANGLE/Metal 下会段错误。
+	# 脚本带幂等与校验，源码变动时会明确报错而非错打。
+	python3 $(SOURCEDIR)/Natives/patch_mobilegl_ios.py $(MOBILEGL_SOURCE_DIR)
 	mkdir -p $(WORKINGDIR)/mobilegl
 	cd $(WORKINGDIR)/mobilegl && cmake \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
