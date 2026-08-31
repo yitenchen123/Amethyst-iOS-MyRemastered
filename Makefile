@@ -422,6 +422,7 @@ dep_mobilegl_build:
 	#（GLES 3.1+/3.2+），ANGLE/Metal 下会段错误。
 	# 脚本带幂等与校验，源码变动时会明确报错而非错打。
 	python3 $(SOURCEDIR)/Natives/patch_mobilegl_ios.py $(MOBILEGL_SOURCE_DIR)
+	python3 $(SOURCEDIR)/Natives/patch_mobilegl_glslang.py $(MOBILEGL_SOURCE_DIR)
 	mkdir -p $(WORKINGDIR)/mobilegl
 	cd $(WORKINGDIR)/mobilegl && cmake \
 		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
