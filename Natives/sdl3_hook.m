@@ -72,6 +72,16 @@ typedef void *(*ame_fn_SDL_EGL_GetProcAddress)(const char *proc);
 typedef void *(*ame_fn_SDL_LoadObject)(const char *path);
 typedef void (*ame_fn_SDL_UnloadObject)(void *handle);
 
+// SDL3 GL 入口（被接管后转交启动器 EGL bridge）
+typedef bool (*ame_fn_SDL_GL_LoadLibrary)(const char *path);
+typedef void *(*ame_fn_SDL_GL_CreateContext)(void *window);
+typedef bool (*ame_fn_SDL_GL_MakeCurrent)(void *window, void *context);
+typedef bool (*ame_fn_SDL_GL_SwapWindow)(void *window);
+typedef void *(*ame_fn_SDL_GL_GetProcAddress)(const char *proc);
+typedef bool (*ame_fn_SDL_GL_SetSwapInterval)(int interval);
+typedef bool (*ame_fn_SDL_GL_DestroyContext)(void *context);
+typedef void *(*ame_fn_SDL_GL_GetCurrentContext)(void);
+
 static ame_fn_SDL_GL_SetAttribute ame_real_GL_SetAttribute = NULL;
 static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
@@ -80,6 +90,15 @@ static ame_fn_SDL_LoadFunction ame_real_LoadFunction = NULL;
 static ame_fn_SDL_EGL_GetProcAddress ame_real_EGL_GetProcAddress = NULL;
 static ame_fn_SDL_LoadObject ame_real_LoadObject = NULL;
 static ame_fn_SDL_UnloadObject ame_real_UnloadObject = NULL;
+
+static ame_fn_SDL_GL_LoadLibrary ame_real_GL_LoadLibrary = NULL;
+static ame_fn_SDL_GL_CreateContext ame_real_GL_CreateContext = NULL;
+static ame_fn_SDL_GL_MakeCurrent ame_real_GL_MakeCurrent = NULL;
+static ame_fn_SDL_GL_SwapWindow ame_real_GL_SwapWindow = NULL;
+static ame_fn_SDL_GL_GetProcAddress ame_real_GL_GetProcAddress = NULL;
+static ame_fn_SDL_GL_SetSwapInterval ame_real_GL_SetSwapInterval = NULL;
+static ame_fn_SDL_GL_DestroyContext ame_real_GL_DestroyContext = NULL;
+static ame_fn_SDL_GL_GetCurrentContext ame_real_GL_GetCurrentContext = NULL;
 
 #pragma mark - EGL 真实函数（首次解析后固定，避免跨 loader 调用）
 
@@ -411,6 +430,135 @@ static void ame_SDL_UnloadObject(void *handle) {
     if (ame_real_UnloadObject) ame_real_UnloadObject(handle);
 }
 
+#pragma mark - 5) SDL GL 入口 → 启动器 EGL bridge
+
+// 为什么需要接管：
+//   SDL 的 UIKit 后端走的是 EAGL / CAEAGLLayer（iOS 系统 OpenGLES 框架），
+//   而 MobileGL / Mithril / MobileGlues 提供的是 **EGL + GL** 符号。两者不是
+//   同一套 ABI，SDL 自己建的上下文拿不到渲染器的 GL 函数，MC 26.3 的
+//   GlBackend 因此判定 OpenGL 不可用并回落到原生 Vulkan。
+//
+//   启动器的 EGL bridge（gl_bridge.m）早已在 GLFW 路径（26.2 及以下）验证可用，
+//   且 gl_init_context() 直接从 SurfaceViewController 的 layer 建 EGL surface，
+//   不依赖 SDL 建了哪个 view —— 所以可以整条搬到 SDL3 路径上复用。
+//
+// 判定复用 ame_sdlGlesCompatEnabled()：它已排除 zink（libOSMesa/gallium_/
+// vulkan_zink）与原生 Vulkan（libMoltenVK），因此 zink 在 26.3 上"回落 Vulkan"
+// 那条已验证可用的路径不会受到任何影响。
+static bool ame_glBridgeEnabled(void) {
+    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", true)) return false;
+
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer == NULL || renderer[0] == '\0') return false;
+
+    // 绝不接管的：zink 在 26.3 上依赖"OpenGL 被隐藏 → 回落 Vulkan"且已验证
+    // 可进世界，是唯一的可用路径，一个字节都不能动。
+    if (strncmp(renderer, "libOSMesa", 9) == 0) return false;    // zink（带版本号）
+    if (strncmp(renderer, "gallium_", 8) == 0) return false;     // OSMesa 系
+    if (strcmp(renderer, "vulkan_zink") == 0) return false;      // zink
+    // 原生 Vulkan 自身走 Vulkan 路径，不需要 GL bridge
+    if (strstr(renderer, "libMoltenVK") != NULL) return false;
+
+    // 需要 EGL bridge 的转译型渲染器：它们提供 EGL + GL 符号，SDL 的 EAGL
+    // 后端无法对接，必须由 bridge 建上下文并供给 GL 函数指针。
+    if (strstr(renderer, "libMobileGL") != NULL) return true;    // MobileGL 双后端
+    if (strstr(renderer, "libmithril") != NULL) return true;     // Mithril
+    if (strstr(renderer, "mobileglues") != NULL) return true;    // MobileGlues
+    if (strstr(renderer, "gl4es") != NULL) return true;          // GL4ES
+    if (strstr(renderer, "libltw") != NULL) return true;         // LTW
+    if (strncmp(renderer, "opengles", 8) == 0) return true;      // 内置 GLES
+
+    return ame_isMobileGluesEgl();
+}
+
+// egl_bridge.m 的上下文入口。这些函数没有公开头文件，故在此 extern 声明。
+// 参数用 void* 以避开 basic_render_window_t 的类型依赖。
+extern int   pojavInitOpenGL(void);
+extern void *pojavCreateContext(void *contextSrc);
+extern void  pojavMakeCurrent(void *window);
+extern void  pojavSwapBuffers(void);
+extern void  pojavSwapInterval(int interval);
+
+static bool   g_glBridgeInited = false;
+static void  *g_glContext = NULL;      // 充当 SDL_GLContext
+static void  *g_rendererHandle = NULL; // 渲染器 dylib 句柄（缓存，避免重复 dlopen）
+
+static void *ame_rendererHandle(void) {
+    if (g_rendererHandle != NULL) return g_rendererHandle;
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer == NULL || renderer[0] == '\0') return NULL;
+    NSString *path = [NSString stringWithFormat:@"@rpath/%s", renderer];
+    // 渲染器已由 pojavInitOpenGL 以 RTLD_GLOBAL 预加载，此处返回同一句柄，
+    // 仅增加引用计数，不会重复映射。
+    g_rendererHandle = dlopen(path.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    if (g_rendererHandle == NULL) {
+        NSDebugLog(@"[SDLHook] renderer dlopen('%@') failed: %s",
+                   path, dlerror() ?: "unknown");
+    }
+    return g_rendererHandle;
+}
+
+// 库已由启动器预加载，这里只负责初始化 bridge
+static bool ame_SDL_GL_LoadLibrary(const char *path) {
+    if (!g_glBridgeInited) {
+        g_glBridgeInited = true;
+        int r = pojavInitOpenGL();
+        NSDebugLog(@"[SDLHook] SDL_GL_LoadLibrary('%s') -> pojavInitOpenGL()=%d (EGL bridge)",
+                   path ?: "<null>", r);
+    }
+    return true;
+}
+
+static void *ame_SDL_GL_CreateContext(void *window) {
+    void *ctx = pojavCreateContext(NULL);
+    if (ctx != NULL) g_glContext = ctx;
+    NSDebugLog(@"[SDLHook] SDL_GL_CreateContext(%p) -> %p (EGL bridge)", window, ctx);
+    return ctx;
+}
+
+static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
+    if (context != NULL) g_glContext = context;
+    pojavMakeCurrent(context);
+    NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
+    return true;
+}
+
+static bool ame_SDL_GL_SwapWindow(void *window) {
+    pojavSwapBuffers();
+    return true;
+}
+
+// GL 函数必须来自渲染器自身。若误返回系统 GLES / EAGL 的实现，
+// LWJGL 拿到的函数指针与 EGL 上下文不匹配，会直接崩。
+static void *ame_SDL_GL_GetProcAddress(const char *proc) {
+    if (proc == NULL) return NULL;
+    void *h = ame_rendererHandle();
+    if (h != NULL) {
+        void *p = dlsym(h, proc);
+        if (p != NULL) return p;
+    }
+    void *r = ame_real_GL_GetProcAddress ? ame_real_GL_GetProcAddress(proc) : NULL;
+    if (r == NULL) r = dlsym(RTLD_DEFAULT, proc);
+    return r;
+}
+
+static bool ame_SDL_GL_SetSwapInterval(int interval) {
+    pojavSwapInterval(interval);
+    return true;
+}
+
+// 上下文由 EGL bridge 持有，生命周期与进程一致。这里不真正销毁，
+// 只摘掉引用 —— 否则 SDL 会用 EAGL 的语义去释放一个 EGL 对象而崩溃。
+static bool ame_SDL_GL_DestroyContext(void *context) {
+    NSDebugLog(@"[SDLHook] SDL_GL_DestroyContext(%p) ignored (owned by EGL bridge)", context);
+    if (g_glContext == context) g_glContext = NULL;
+    return true;
+}
+
+static void *ame_SDL_GL_GetCurrentContext(void) {
+    return g_glContext;
+}
+
 #pragma mark - 对 main_hook.m 的接入点
 
 /// 由 hooked_dlsym 在返回 orig_dlsym 之前调用。
@@ -468,6 +616,56 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
+
+    // SDL GL 上下文接管（MobileGL / Mithril / MobileGlues / gl4es / LTW）
+    if (ame_glBridgeEnabled()) {
+        if (strcmp(name, "SDL_GL_LoadLibrary") == 0) {
+            if (ame_real_GL_LoadLibrary == NULL)
+                ame_real_GL_LoadLibrary = (ame_fn_SDL_GL_LoadLibrary)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_LoadLibrary -> EGL bridge");
+            return (void *)ame_SDL_GL_LoadLibrary;
+        }
+        if (strcmp(name, "SDL_GL_CreateContext") == 0) {
+            if (ame_real_GL_CreateContext == NULL)
+                ame_real_GL_CreateContext = (ame_fn_SDL_GL_CreateContext)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_CreateContext -> EGL bridge");
+            return (void *)ame_SDL_GL_CreateContext;
+        }
+        if (strcmp(name, "SDL_GL_MakeCurrent") == 0) {
+            if (ame_real_GL_MakeCurrent == NULL)
+                ame_real_GL_MakeCurrent = (ame_fn_SDL_GL_MakeCurrent)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_MakeCurrent -> EGL bridge");
+            return (void *)ame_SDL_GL_MakeCurrent;
+        }
+        if (strcmp(name, "SDL_GL_SwapWindow") == 0) {
+            if (ame_real_GL_SwapWindow == NULL)
+                ame_real_GL_SwapWindow = (ame_fn_SDL_GL_SwapWindow)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_SwapWindow -> EGL bridge");
+            return (void *)ame_SDL_GL_SwapWindow;
+        }
+        if (strcmp(name, "SDL_GL_GetProcAddress") == 0) {
+            if (ame_real_GL_GetProcAddress == NULL)
+                ame_real_GL_GetProcAddress = (ame_fn_SDL_GL_GetProcAddress)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_GetProcAddress -> renderer dlsym");
+            return (void *)ame_SDL_GL_GetProcAddress;
+        }
+        if (strcmp(name, "SDL_GL_SetSwapInterval") == 0) {
+            if (ame_real_GL_SetSwapInterval == NULL)
+                ame_real_GL_SetSwapInterval = (ame_fn_SDL_GL_SetSwapInterval)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_SetSwapInterval -> EGL bridge");
+            return (void *)ame_SDL_GL_SetSwapInterval;
+        }
+        if (strcmp(name, "SDL_GL_DestroyContext") == 0) {
+            if (ame_real_GL_DestroyContext == NULL)
+                ame_real_GL_DestroyContext = (ame_fn_SDL_GL_DestroyContext)amethyst_orig_dlsym(handle, name);
+            return (void *)ame_SDL_GL_DestroyContext;
+        }
+        if (strcmp(name, "SDL_GL_GetCurrentContext") == 0) {
+            if (ame_real_GL_GetCurrentContext == NULL)
+                ame_real_GL_GetCurrentContext = (ame_fn_SDL_GL_GetCurrentContext)amethyst_orig_dlsym(handle, name);
+            return (void *)ame_SDL_GL_GetCurrentContext;
+        }
+    }
 
     return NULL;
 }
