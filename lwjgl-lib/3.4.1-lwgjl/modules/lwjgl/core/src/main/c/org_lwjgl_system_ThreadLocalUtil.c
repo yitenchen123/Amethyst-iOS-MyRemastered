@@ -59,8 +59,6 @@ JNIEXPORT jlong JNICALL Java_org_lwjgl_system_ThreadLocalUtil_setupEnvData(JNIEn
     return (jlong)(uintptr_t)tlsCreateEnvDataWithCopy(env);
 }
 
-EXTERN_C_EXIT
-
 /* Amethyst-iOS: LWJGL jars (both lwjgl-333 and lwjgl-341) declare the native method
  * as ThreadLocalUtil.nsetupEnvData(int), but this fork names the C entry point
  * ..._setupEnvData. JNI resolution then fails at runtime with:
@@ -69,3 +67,5 @@ EXTERN_C_EXIT
 JNIEXPORT jlong JNICALL Java_org_lwjgl_system_ThreadLocalUtil_nsetupEnvData(JNIEnv *env, jclass clazz, jint functionCount) {
     return Java_org_lwjgl_system_ThreadLocalUtil_setupEnvData(env, clazz, functionCount);
 }
+
+EXTERN_C_EXIT
