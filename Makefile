@@ -392,7 +392,16 @@ dep_mobilegl_build:
 		-DMOBILEGL_VULKAN_LIBRARY="$(MOLTENVK_LIBRARY)" \
 		$(MOBILEGL_SOURCE_DIR)
 	cmake --build $(WORKINGDIR)/mobilegl --config $(CMAKE_BUILD_TYPE) -j$(JOBS) --target MobileGL
-	install_name_tool -change @rpath/MoltenVK.framework/MoltenVK @rpath/libMoltenVK.dylib $(WORKINGDIR)/mobilegl/libMobileGL.dylib
+	# MoltenVK 1.4.2 的 install name 已经是 @rpath/libMoltenVK.dylib，与链接时记录的
+	# 完全一致，无需改写。只有老版本（1.2.x，install name 为
+	# @rpath/MoltenVK.framework/MoltenVK）才需要 -change。
+	# 先探测再改：install_name_tool -change 找不到目标时会中断构建，不能无条件执行。
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'MoltenVK.framework/MoltenVK'; then \
+		install_name_tool -change @rpath/MoltenVK.framework/MoltenVK @rpath/libMoltenVK.dylib $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - rewrote MoltenVK install name (legacy layout)'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - MoltenVK install name already @rpath/libMoltenVK.dylib, no rewrite needed'; \
+	fi
 	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'path $(SOURCEDIR)/Natives/resources/Frameworks '; then \
 		install_name_tool -delete_rpath $(SOURCEDIR)/Natives/resources/Frameworks $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
 	fi

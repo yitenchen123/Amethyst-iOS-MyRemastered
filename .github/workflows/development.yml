@@ -109,10 +109,27 @@ jobs:
           rm -rf Natives/external/MobileGL
           git clone --depth 1 https://github.com/MobileGL-Dev/MobileGL.git Natives/external/MobileGL
           cd Natives/external/MobileGL
-          # Only the submodules the iOS build actually needs; skip apitrace/tracy etc.
-          for m in 3rdparty/glslang 3rdparty/SPIRV-Cross 3rdparty/DiligentCore 3rdparty/Vulkan-Headers; do
-            git submodule update --init --depth 1 --recursive "$m" || true
+          # MobileGL 的 CMakeLists 对下面这批是无条件 add_subdirectory()，缺任意一个
+          # configure 就会失败。apitrace / tracy 不参与 iOS 构建，跳过。
+          for m in 3rdparty/glslang \
+                   3rdparty/SPIRV-Cross \
+                   3rdparty/SPIRV-Reflect \
+                   3rdparty/Vulkan-Headers \
+                   3rdparty/VulkanMemoryAllocator \
+                   3rdparty/xxHash \
+                   3rdparty/asio \
+                   include/ska; do
+            git submodule update --init --depth 1 "$m" \
+              || echo "::warning::MobileGL submodule $m unavailable"
           done
+          # Vulkan-Utility-Libraries 自带 Vulkan-Headers 子模块，必须 --recursive
+          git submodule update --init --depth 1 --recursive 3rdparty/Vulkan-Utility-Libraries \
+            || echo "::warning::MobileGL submodule Vulkan-Utility-Libraries unavailable"
+          # DiligentCore 本身不参与编译（CMakeLists 里 add_subdirectory 已注释），
+          # 只为 Makefile 的软链接提供 ThirdParty/SPIRV-Tools 与 SPIRV-Headers。
+          # 该仓库自身没有子模块，不需要 --recursive（省下大量 clone 时间）。
+          git submodule update --init --depth 1 3rdparty/DiligentCore \
+            || echo "::warning::MobileGL submodule DiligentCore unavailable"
 
       - name: Build for ${{ matrix.platform_name }}
         env:
