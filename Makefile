@@ -372,6 +372,18 @@ dep_mobilegl:
 # 下面所有 perl 补丁都用 grep -q 做幂等守卫：上游若已自行修复则整条跳过，
 # 不会因为源码变动而重复插入或报错。
 dep_mobilegl_build:
+	# asio 是 MobileGL 的 header-only 依赖，但 vendoring 它要额外 636 个文件
+	#（约 5MB），而它只被 MG_Util/Async/ShaderCompilePool.cpp 用到，且 asio
+	# 是极稳定的库 —— 故按 tag 在构建时拉取，不进仓库。
+	# 用 tag（asio-1-38-2）而非分支：tag 不会被 force push，避免上游变动导致
+	# 构建突然中断。以 post.hpp 是否存在为判据（而非目录），残缺目录也能补齐。
+	if [ ! -f "$(MOBILEGL_SOURCE_DIR)/3rdparty/asio/include/asio/post.hpp" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - fetching asio (asio-1-38-2)'; \
+		rm -rf $(MOBILEGL_SOURCE_DIR)/3rdparty/asio; \
+		git clone --depth 1 --branch asio-1-38-2 https://github.com/chriskohlhoff/asio.git \
+			$(MOBILEGL_SOURCE_DIR)/3rdparty/asio || \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - WARNING: asio fetch failed, build will likely fail'; \
+	fi
 	mkdir -p $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External
 	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-tools
 	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Headers $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-headers
