@@ -363,7 +363,9 @@ dep_mobilegl:
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - end (log: $(SOURCEDIR)/mobilegl-build.log)'; \
 	fi
 
-# MobileGL（MobileGL-Dev，LGPL-3.0）：桌面 OpenGL 实现，两个后端共用同一个二进制：
+# MobileGL（MobileGL-Dev，LGPL-3.0）：
+# 2026-08-31 首次编译成功（libMobileGL.dylib / libMobileGL-gles.dylib），
+# 后续应把 dylib 提交进仓库并关掉 BUILD_MOBILEGL，改源码时才重开。：桌面 OpenGL 实现，两个后端共用同一个二进制：
 #   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
 #   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
 # 运行时由环境变量 MOBILEGL_BACKEND_TYPE 选择（见 Natives/JavaLauncher.m）。
