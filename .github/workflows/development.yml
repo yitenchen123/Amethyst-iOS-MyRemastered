@@ -102,7 +102,7 @@ jobs:
         env:
           IPHONEOS_DEPLOYMENT_TARGET: 14.0
           CONFIG_CURSEFORGE_API_KEY: ${{ secrets.CONFIG_CURSEFORGE_API_KEY }}
-          # 供上面的 Fetch MobileGL source 与下面的 make 使用。
+          # 供下面的 make 使用（控制 dep_mobilegl 是否从仓库内源码编译 MobileGL）。
           # 在 env: 里引用 vars 是官方支持的用法；不要写成
           # `export BUILD_MOBILEGL=${{ vars.BUILD_MOBILEGL || '0' }}` 放进 run:，
           # 那样仍会在 workflow 编译期求值 vars。
@@ -124,6 +124,25 @@ jobs:
           else
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
           fi
+
+      - name: Upload MobileGL dylib (if built)
+        # MobileGL 从源码编译，产物在 Natives/build/ 下。单独上传一份，
+        # 这样验证通过后可以直接拿到 dylib 提交进仓库，不必下载 195MB 的 ipa 再提取。
+        # 未开启 BUILD_MOBILEGL 或编译失败时目录不存在，用 hashFiles 判断后跳过。
+        if: matrix.platform_name == 'ios' && success() && hashFiles('Natives/build/libMobileGL.dylib') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMobileGL.dylib
+          path: Natives/build/libMobileGL.dylib
+          if-no-files-found: ignore
+
+      - name: Upload MobileGL GLES dylib (if built)
+        if: matrix.platform_name == 'ios' && success() && hashFiles('Natives/build/libMobileGL-gles.dylib') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMobileGL-gles.dylib
+          path: Natives/build/libMobileGL-gles.dylib
+          if-no-files-found: ignore
 
       - name: Upload regular ipa
         uses: actions/upload-artifact@v4
