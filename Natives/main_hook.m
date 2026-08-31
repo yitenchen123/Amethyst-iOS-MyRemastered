@@ -53,6 +53,71 @@ static bool amethyst_SDL_SetWindowMouseGrab(void *window, bool grabbed) {
     }
     return false;
 }
+
+// --- SDL3 OpenGL 库装载兼容 ---
+//
+// MC 26.3 (RenderPearl) 在 GlBackend.loadLibrary() 中调用 SDL_GL_LoadLibrary()
+// 自行装载 OpenGL 库。但启动器为了让 LWJGL 拿得到 GL 入口，会通过
+// -Dorg.lwjgl.opengl.libname=<renderer> 让 LWJGL 在 JVM 启动阶段就 dlopen 了
+// 渲染器（见 JavaLauncher.m：NativeLibrariesBootstrap.loadOpenGL() 会无条件
+// 初始化 org.lwjgl.opengl.GL）。
+//
+// SDL3 语义：已有驱动装载且请求的 path 与之不同 -> 报错
+// "OpenGL library already loaded"。于是 MC 判定 OpenGL 不可用，回落到原生
+// Vulkan（MoltenVK），MobileGL / MobileGlues 这类 GL 转译渲染器完全失效，
+// 最终撞上 RenderPearl 的 shaderc/glslang 路径而崩溃。
+//
+// 该错误其实意味着"库已装载且正是我们选中的渲染器"，故视为成功；
+// 其它错误（找不到库等）仍如实返回失败。
+typedef bool (*PFN_SDL_GL_LoadLibrary)(const char *path);
+typedef const char *(*PFN_SDL_GetError)(void);
+typedef bool (*PFN_SDL_GL_SetAttribute)(int attr, int value);
+
+static PFN_SDL_GL_LoadLibrary g_real_SDL_GL_LoadLibrary = NULL;
+static PFN_SDL_GetError g_real_SDL_GetError = NULL;
+static PFN_SDL_GL_SetAttribute g_real_SDL_GL_SetAttribute = NULL;
+
+// SDL3 SDL_GLattr 中几个与上下文选择相关的取值（序号对齐 SDL3.4 头文件）
+#define AME_SDL_GL_CONTEXT_MAJOR_VERSION 17
+#define AME_SDL_GL_CONTEXT_MINOR_VERSION 18
+#define AME_SDL_GL_CONTEXT_PROFILE_MASK  20
+
+static const char *ame_gl_attr_name(int attr) {
+    switch (attr) {
+        case AME_SDL_GL_CONTEXT_MAJOR_VERSION: return "CONTEXT_MAJOR_VERSION";
+        case AME_SDL_GL_CONTEXT_MINOR_VERSION: return "CONTEXT_MINOR_VERSION";
+        case AME_SDL_GL_CONTEXT_PROFILE_MASK:  return "CONTEXT_PROFILE_MASK";
+        default:                               return "other";
+    }
+}
+
+// 仅记录 MC 请求的上下文属性，用于判断它走的是桌面 GL 还是 ES
+static bool amethyst_SDL_GL_SetAttribute(int attr, int value) {
+    NSLog(@"[SDLGL] SDL_GL_SetAttribute(%s=%d, value=%d)", ame_gl_attr_name(attr), attr, value);
+    if (g_real_SDL_GL_SetAttribute) return g_real_SDL_GL_SetAttribute(attr, value);
+    return false;
+}
+
+static bool amethyst_SDL_GL_LoadLibrary(const char *path) {
+    if (!g_real_SDL_GL_LoadLibrary) return false;
+    bool ok = g_real_SDL_GL_LoadLibrary(path);
+    if (ok) {
+        NSLog(@"[SDLGL] SDL_GL_LoadLibrary(%s) -> ok", path ? path : "(default)");
+        return true;
+    }
+    const char *err = g_real_SDL_GetError ? g_real_SDL_GetError() : NULL;
+    NSLog(@"[SDLGL] SDL_GL_LoadLibrary(%s) -> failed: %s",
+          path ? path : "(default)", err ? err : "(no error)");
+    if (getenv("AMETHYST_SDL_STRICT_GL_LOAD") != NULL) {
+        return false;  // 诊断用：保留原始失败行为
+    }
+    if (err != NULL && strstr(err, "already loaded") != NULL) {
+        NSLog(@"[SDLGL] treating 'already loaded' as success "
+              @"(renderer preloaded via -Dorg.lwjgl.opengl.libname)");
+        return true;
+    }
+    return false;
+}
 int (*orig_open)(const char *path, int oflag, ...);
 
 /// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
@@ -1154,6 +1219,27 @@ void* hooked_dlsym(void* handle, const char* name) {
     if (name != NULL && strncmp(name, "SDL_Set", 7) == 0 &&
         (strstr(name, "Mouse") != NULL || strstr(name, "Relative") != NULL)) {
         NSLog(@"[InputDiag] dlsym query: %s", name);
+    }
+
+    // SDL3 OpenGL 装载：见上方 amethyst_SDL_GL_LoadLibrary 的说明
+    if (name != NULL && strcmp(name, "SDL_GL_LoadLibrary") == 0) {
+        if (!g_real_SDL_GL_LoadLibrary) {
+            g_real_SDL_GL_LoadLibrary = (PFN_SDL_GL_LoadLibrary)orig_dlsym(handle, name);
+            g_real_SDL_GetError = (PFN_SDL_GetError)orig_dlsym(handle, "SDL_GetError");
+        }
+        NSLog(@"[SDLGL] dlsym intercepted: SDL_GL_LoadLibrary (real=%p)",
+              (void *)g_real_SDL_GL_LoadLibrary);
+        return (void *)amethyst_SDL_GL_LoadLibrary;
+    }
+    if (name != NULL && strcmp(name, "SDL_GL_SetAttribute") == 0) {
+        if (!g_real_SDL_GL_SetAttribute) {
+            g_real_SDL_GL_SetAttribute = (PFN_SDL_GL_SetAttribute)orig_dlsym(handle, name);
+        }
+        return (void *)amethyst_SDL_GL_SetAttribute;
+    }
+    // 诊断：记录 MC 查询了哪些 SDL_GL_* 入口，用于判断它实际走的上下文路径
+    if (name != NULL && strncmp(name, "SDL_GL_", 7) == 0) {
+        NSLog(@"[SDLGL] dlsym query: %s", name);
     }
 
     if (name != NULL && g_zinkStrideFixActive) {
