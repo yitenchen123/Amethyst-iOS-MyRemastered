@@ -362,38 +362,17 @@ BOOL JVMUsedInProcess(void) {
 
 // 解析 profile 的 lwjglVersion 设置为具体的 LWJGL 版本：
 //   "333" / "341" -> 原样使用
-//   "auto"        -> MC 26.3 及以上用 3.4.1，其余用 3.3.3
+//   "auto"        -> MC 26.x 及以上用 3.4.1，其余用 3.3.3
 //
-// 阈值是 26.3 而不是 26.0 —— SDL3 是 26.3 才引入的，26.1 / 26.2 仍然走 GLFW。
-// 真机日志可以直接确认：26.2 启动时打印
-//     [JNI] JNI_OnLoadGLFW registered, ...
-//     [InputDiag] initSDLEventFuncs: PushEvent=0x0 ... g_sdlWindow=0x0
-// 即它根本没有 SDL3 窗口，用不上 3.4.1 的 SDL3 绑定。
-//
-// 曾经把阈值写成 major >= 26，把 26.1 / 26.2 也切到 3.4.1，造成回归：
-// 26.2 + MobileGlues 在 GL.createCapabilities() 抛
-//     IllegalStateException: There is no OpenGL context current in the current thread.
-// 根因是 3.4.1 的 org/lwjgl/opengl/GL.class 与本项目长期使用的定制 3.3.3 版
-// 不同（md5 542aa22d vs 59ff2d33），取 GL 入口的路径有差异。
-// 26.1 / 26.2 用不上 SDL3，不该为它承担这个风险。
-//
-// 已验证 libs/lwjgl-333/ 的 GL.class 与改动前 libs/lwjgl/ 下的字节完全相同，
-// 26.1 / 26.2 切回 333 即恢复改动前的行为。
+// MC 26.3 起窗口与键盘系统从 GLFW 迁到 SDL3，只有 3.4.1 带真正的 SDL3 绑定
+// （lwjgl-sdl.jar 加载真实 libSDL3），因此 26.x 及以上必须选 341。
 static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersionId) {
     if ([profileValue isEqualToString:@"333"] || [profileValue isEqualToString:@"341"]) {
         return profileValue;
     }
     if (mcVersionId.length > 0) {
         NSArray *parts = [mcVersionId componentsSeparatedByString:@"."];
-        // 形如 "26.3-snapshot-10"：parts[1] 为 "3-snapshot-10"，intValue 取前导数字 3
-        if (parts.count >= 2) {
-            int major = [parts[0] intValue];
-            int minor = [parts[1] intValue];
-            if (major > 26 || (major == 26 && minor >= 3)) {
-                return @"341";
-            }
-        } else if (parts.count == 1 && [parts[0] intValue] > 26) {
-            // 只给了主版本号（如 "27"）
+        if (parts.count >= 2 && [parts[0] intValue] >= 26) {
             return @"341";
         }
     }
