@@ -144,6 +144,18 @@ jobs:
           path: Natives/build/libMobileGL-gles.dylib
           if-no-files-found: ignore
 
+      - name: Upload MobileGL build log
+        # MobileGL 从源码编译，Air 仓库历史上 9 个提交都没编过。
+        # payload 里用 `-$(MAKE) dep_mobilegl` 调用，失败不阻断主构建，
+        # 因此失败原因会被静默吞掉 —— 这里把 dep_mobilegl 落盘的日志
+        # （含诊断信息与真实退出码）无条件上传，便于定位。
+        if: matrix.platform_name == 'ios' && always() && hashFiles('mobilegl-build.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobilegl-build.log
+          path: mobilegl-build.log
+          if-no-files-found: ignore
+
       - name: Upload regular ipa
         uses: actions/upload-artifact@v4
         if: success()

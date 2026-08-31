@@ -344,7 +344,23 @@ dep_mobilegl:
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
 	else \
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - start'; \
-		$(MAKE) -f $(abspath $(lastword $(MAKEFILE_LIST))) dep_mobilegl_build; \
+		rm -f $(SOURCEDIR)/mobilegl-build.log $(SOURCEDIR)/mobilegl-build.status; \
+		{ echo '== MobileGL build diagnostics =='; \
+		  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
+		  echo "  MOBILEGL_SOURCE_DIR = $(MOBILEGL_SOURCE_DIR)"; \
+		  echo "  source exists       = `test -d '$(MOBILEGL_SOURCE_DIR)' && echo yes || echo no`"; \
+		  echo "  cmake               = `cmake --version 2>&1 | head -1`"; \
+		  echo "  moltenvk            = `test -f '$(MOLTENVK_LIBRARY)' && echo yes || echo no` ($(MOLTENVK_LIBRARY))"; \
+		  echo "  glslang dir         = `test -d '$(MOBILEGL_SOURCE_DIR)/3rdparty/glslang' && echo yes || echo no`"; \
+		  echo "  spirv-tools dir     = `test -d '$(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools' && echo yes || echo no`"; \
+		  echo '== build output =='; \
+		} 2>&1 | tee $(SOURCEDIR)/mobilegl-build.log; \
+		{ { $(MAKE) -f $(abspath $(lastword $(MAKEFILE_LIST))) dep_mobilegl_build; \
+		    echo $$? > $(SOURCEDIR)/mobilegl-build.status; \
+		  } 2>&1 | tee -a $(SOURCEDIR)/mobilegl-build.log; \
+		}; \
+		echo "== exit status = `cat $(SOURCEDIR)/mobilegl-build.status 2>/dev/null` ==" | tee -a $(SOURCEDIR)/mobilegl-build.log; \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - end (log: $(SOURCEDIR)/mobilegl-build.log)'; \
 	fi
 
 # MobileGL（MobileGL-Dev，LGPL-3.0）：桌面 OpenGL 实现，两个后端共用同一个二进制：
