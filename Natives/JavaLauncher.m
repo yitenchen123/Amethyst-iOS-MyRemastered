@@ -544,6 +544,40 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             setenv("POJAVEXEC_EGL", RENDERER_NAME_LTW, 1);
             NSLog(@"[JavaLauncher] LTW renderer active: using LTW defaults (same as Android)");
         }
+
+        // Apply MobileGL-specific environment variables
+        // MobileGL（MobileGL-Dev，LGPL-3.0）两个变体共用同一个 libMobileGL.dylib 二进制，
+        // 靠 MOBILEGL_BACKEND_TYPE 在运行时选择后端：
+        //   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+        //   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+        // 必须在 JVM 启动前设置：MobileGL 的 constructor 在 dlopen 时就读取该变量。
+        //
+        // MOBILEGL_LOG_FILE_PATH 指向 POJAV_HOME 下的 mobilegl.log，便于导出诊断。
+        // 日志量较大，仅在选中 MobileGL 时开启。
+        if (isMobileGLRenderer(renderer.UTF8String)) {
+            const char *backend = [renderer isEqualToString:@ RENDERER_NAME_MOBILEGL_GLES]
+                ? "DirectGLES" : "DirectVulkan";
+            setenv("MOBILEGL_BACKEND_TYPE", backend, 1);
+            const char *pojavHome = getenv("POJAV_HOME");
+            if (pojavHome && *pojavHome) {
+                NSString *logPath = [NSString stringWithFormat:@"%s/mobilegl.log", pojavHome];
+                setenv("MOBILEGL_LOG_FILE_PATH", logPath.UTF8String, 1);
+            }
+            NSLog(@"[JavaLauncher] MobileGL renderer active: backend=%s", backend);
+        } else {
+            // 切换渲染器后清掉，避免残留影响后续启动
+            unsetenv("MOBILEGL_BACKEND_TYPE");
+            unsetenv("MOBILEGL_LOG_FILE_PATH");
+        }
+
+        // Mithril 渲染器（libmithril.dylib）自带 EGL + GL 3.3 Core（Vulkan backend），
+        // 不需要额外的环境变量：EGL 符号由 gl_bridge.m 的 dlsym_EGL() 从自身 dylib 解析，
+        // GL 上下文由 gl_init_context 用 EGL_OPENGL_BIT + EGL_OPENGL_API 创建。
+        // SDL3 在本项目走 uikit video driver（窗口由 UIKit/Metal 提供），
+        // 不涉及 SDL 的 EGL 库选择，因此无需设置 SDL 侧 EGL 路径。
+        if (isMithrilRenderer(renderer.UTF8String)) {
+            NSLog(@"[JavaLauncher] Mithril renderer active: EGL/GL from libmithril.dylib (Vulkan backend)");
+        }
         // Setup AMETHYST_GRAPHICS_API（MC 26.2+ Graphics API：default/vulkan/opengl）
         // 仅 MC 26.2+ 识别此选项，旧版本 MC 会忽略 options.txt 中的 graphicsApi 字段。
         //

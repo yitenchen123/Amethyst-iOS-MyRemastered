@@ -83,6 +83,37 @@ jobs:
           GIT_LFS_SKIP_SMUDGE: "1"
         run: git submodule update --init --recursive
 
+      # ---- optional renderers: Mithril (prebuilt) and MobileGL (from source) ----
+      # Both are no-ops by default and cannot slow down or break the normal build:
+      #   - Mithril needs a cross-repo artifact download, gated on MITHRIL_FETCH_TOKEN
+      #   - MobileGL needs cloning upstream sources, gated on repo variable BUILD_MOBILEGL
+      # If either is missing, the renderer is simply hidden in Settings
+      # (LauncherPreferences.m filters by dylib existence).
+      - name: Fetch Mithril renderer (optional)
+        if: vars.MITHRIL_ARTIFACT_ID != '' && secrets.MITHRIL_FETCH_TOKEN != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.MITHRIL_FETCH_TOKEN }}
+          ARTIFACT_ID: ${{ vars.MITHRIL_ARTIFACT_ID }}
+        run: |
+          set -eu
+          sh scripts/fetch_mithril.sh || {
+            echo "::warning::Mithril download failed; this build has no Mithril renderer"
+          }
+
+      - name: Fetch MobileGL source (optional)
+        if: vars.BUILD_MOBILEGL == '1'
+        env:
+          GIT_LFS_SKIP_SMUDGE: "1"
+        run: |
+          set -eu
+          rm -rf Natives/external/MobileGL
+          git clone --depth 1 https://github.com/MobileGL-Dev/MobileGL.git Natives/external/MobileGL
+          cd Natives/external/MobileGL
+          # Only the submodules the iOS build actually needs; skip apitrace/tracy etc.
+          for m in 3rdparty/glslang 3rdparty/SPIRV-Cross 3rdparty/DiligentCore 3rdparty/Vulkan-Headers; do
+            git submodule update --init --depth 1 --recursive "$m" || true
+          done
+
       - name: Build for ${{ matrix.platform_name }}
         env:
           IPHONEOS_DEPLOYMENT_TARGET: 14.0
@@ -91,6 +122,7 @@ jobs:
           set -o pipefail
           export PATH=/opt/homebrew/bin:$PATH
           export SLIMMED=0
+          export BUILD_MOBILEGL=${{ vars.BUILD_MOBILEGL || '0' }}
 
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}

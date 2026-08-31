@@ -105,6 +105,12 @@ POJAV_JRE17_DIR       ?= $(SOURCEDIR)/depends/java-17-openjdk
 POJAV_JRE21_DIR       ?= $(SOURCEDIR)/depends/java-21-openjdk
 POJAV_JRE25_DIR       ?= $(SOURCEDIR)/depends/java-25-openjdk
 MOLTENVK_LIBRARY      ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMoltenVK.dylib
+MOBILEGL_SOURCE_DIR   ?= $(SOURCEDIR)/Natives/external/MobileGL
+# MobileGL 默认不构建：其源码 + 递归子模块（DiligentCore/glslang/SPIRV-Cross 等）体积巨大，
+# 且上游尚无预编译产物，只能在构建时从源码编译，会显著拉长 CI 时间且易受上游改动影响。
+# 需要时用 BUILD_MOBILEGL=1 显式开启（源码目录必须已存在）。
+BUILD_MOBILEGL        ?= 0
+MITHRIL_PREBUILT_DIR  ?= $(SOURCEDIR)/prebuilt
 
 # Function to use later for checking dependencies
 METHOD_DEPCHECK   = $(shell $(1) >/dev/null 2>&1 && echo 1)
@@ -330,12 +336,91 @@ dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
 
 dep_mobilegl:
-	# MobileGL（Vulkan/GLES 后端渲染器）集成已完全移除：
-	# - 构建链中的 perl 补丁（Range1D/BufferChange/is_aggregate_v）不再需要
-	# - libMobileGL.dylib / libMobileGL-gles.dylib 不再构建/打包
-	# - 运行时不再提供 MobileGL 渲染器选项
-	# 保留空目标避免外部 make 调用报错（payload 不再依赖此目标）
-	@echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (MobileGL removed)'
+	@if [ '$(BUILD_MOBILEGL)' != '1' ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build MobileGL from source)'; \
+	elif [ ! -d "$(MOBILEGL_SOURCE_DIR)" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mobilegl - start'; \
+		$(MAKE) -f $(abspath $(lastword $(MAKEFILE_LIST))) dep_mobilegl_build; \
+	fi
+
+# MobileGL（MobileGL-Dev，LGPL-3.0）：桌面 OpenGL 实现，两个后端共用同一个二进制：
+#   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+#   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+# 运行时由环境变量 MOBILEGL_BACKEND_TYPE 选择（见 Natives/JavaLauncher.m）。
+#
+# 参考实现：Swung0x48/Amethyst-iOS 提交 dc57bfd3d2 "feat: add MobileGL renderer support"。
+# 下面所有 perl 补丁都用 grep -q 做幂等守卫：上游若已自行修复则整条跳过，
+# 不会因为源码变动而重复插入或报错。
+dep_mobilegl_build:
+	mkdir -p $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-tools
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Headers $(MOBILEGL_SOURCE_DIR)/3rdparty/glslang/External/spirv-headers
+	mkdir -p $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools/external
+	ln -sfn $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Headers $(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools/external/spirv-headers
+	grep -q 'Range1D() = default' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 'if (/struct Range1D {/) { $$_ .= "        Range1D() = default; Range1D(SizeT s, SizeT e) : start(s), end(e) {}\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q '#include <type_traits>' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 'if (index($$_, "#include <Includes.h>") == 0) { $$_ .= "#include <type_traits>\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q 'std::is_aggregate_v<T>' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h || perl -i -pe 's/        return std::make_unique\x3CT\x3E\(std::forward\x3CArgs\x3E\(args\)\.\.\.\);/        if constexpr (std::is_aggregate_v<T>) {\n            return std::unique_ptr<T>(new T{std::forward<Args>(args)...});\n        } else {\n            return std::make_unique<T>(std::forward<Args>(args)...);\n        }/' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_Util/Types.h
+	grep -q 'BufferChange() = default' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_State/GLState/BufferState/BufferObject.h || perl -i -pe 'if (/struct BufferChange {/) { $$_ .= "        BufferChange() = default; BufferChange(Flags<BufferChangeBits> bits) : Bits(bits) {}\n" }' $(MOBILEGL_SOURCE_DIR)/MobileGL/MG_State/GLState/BufferState/BufferObject.h
+	# AppleClang 15（Xcode 15.4）对 P0960（C++20 聚合体圆括号初始化）支持不完整，
+	# 聚合体（DefaultFramebufferInfo/Error/Range1D/BufferChange）用 std::make_unique 圆括号
+	# new T(args) 初始化会失败；但非聚合体（如 spirvtools Instruction 有 uint32_t 构造函数，
+	# 调用方传 int）用 brace-init new T{args} 会 int->uint32_t narrowing。两者矛盾。
+	# 方案：用 if constexpr + std::is_aggregate_v<T> 分派——
+	#   聚合体  -> brace-init new T{args}（DefaultFramebufferInfo/Error 安全，不 narrowing）
+	#   非聚合体-> make_unique 圆括号（调用构造函数，int->uint32_t 普通隐式转换不 narrowing）
+	# Range1D/BufferChange 加了显式构造函数补丁后不再是聚合体（is_aggregate_v=false），
+	# 走 make_unique 圆括号调用构造函数 Range1D(SizeT,SizeT)（int->size_t 普通转换）。
+	# Range1D/BufferChange 构造函数补丁必须保留：GL_Buffer.cpp 等仍用 Range1D(x,y) 圆括号
+	# 直接构造临时对象（不经 MakeUnique），若无构造函数则 C++17 聚合体圆括号语法不可用。
+	mkdir -p $(WORKINGDIR)/mobilegl
+	cd $(WORKINGDIR)/mobilegl && cmake \
+		-DCMAKE_BUILD_TYPE=$(CMAKE_BUILD_TYPE) \
+		-DCMAKE_CROSSCOMPILING=true \
+		-DCMAKE_SYSTEM_NAME=Darwin \
+		-DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+		-DCMAKE_OSX_SYSROOT="$(SDKPATH)" \
+		-DCMAKE_OSX_ARCHITECTURES=arm64 \
+		-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+		-DCMAKE_C_FLAGS="-arch arm64" \
+		-DCMAKE_CXX_FLAGS="-arch arm64" \
+		-DMOBILEGL_IOS=ON \
+		-DMOBILEGL_BUILD_TEST=OFF \
+		-DMOBILEGL_BUILD_BENCHMARK=OFF \
+		-DMOBILEGL_BUILD_TRACE_REPLAY=OFF \
+		-DMOBILEGL_VULKAN_LIBRARY="$(MOLTENVK_LIBRARY)" \
+		$(MOBILEGL_SOURCE_DIR)
+	cmake --build $(WORKINGDIR)/mobilegl --config $(CMAKE_BUILD_TYPE) -j$(JOBS) --target MobileGL
+	install_name_tool -change @rpath/MoltenVK.framework/MoltenVK @rpath/libMoltenVK.dylib $(WORKINGDIR)/mobilegl/libMobileGL.dylib
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'path $(SOURCEDIR)/Natives/resources/Frameworks '; then \
+		install_name_tool -delete_rpath $(SOURCEDIR)/Natives/resources/Frameworks $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+	fi
+	if otool -l $(WORKINGDIR)/mobilegl/libMobileGL.dylib | grep -q 'path @loader_path '; then \
+		install_name_tool -delete_rpath @loader_path $(WORKINGDIR)/mobilegl/libMobileGL.dylib; \
+	fi
+	install_name_tool -add_rpath @loader_path $(WORKINGDIR)/mobilegl/libMobileGL.dylib
+	cp $(WORKINGDIR)/mobilegl/libMobileGL.dylib $(WORKINGDIR)/libMobileGL.dylib
+	# GLES 变体是同一个二进制的副本，install_name 改掉以便两个 dylib 能同时加载
+	cp $(WORKINGDIR)/mobilegl/libMobileGL.dylib $(WORKINGDIR)/libMobileGL-gles.dylib
+	install_name_tool -id @rpath/libMobileGL-gles.dylib $(WORKINGDIR)/libMobileGL-gles.dylib
+	echo '[Amethyst v$(VERSION)] dep_mobilegl - end'
+
+# Mithril（Uniaball/Mithril-Wrapper）：OpenGL 3.3 Core -> Vulkan -> MoltenVK -> Metal。
+# 与 MobileGL 不同，Mithril 有 CI 产出的预编译 libmithril.dylib，直接放进
+# Natives/resources/Frameworks/ 即可（payload 的 cp -R Natives/resources/* 会自动打包）。
+# 用 scripts/fetch_mithril.sh 下载；本目标只是把它从 prebuilt/ 落位并给出明确提示，
+# 缺失时只告警不失败——Mithril 是可选渲染器，不该阻断主构建。
+dep_mithril:
+	if [ -f "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" ]; then \
+		cp "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" $(SOURCEDIR)/Natives/resources/Frameworks/libmithril.dylib; \
+		echo '[Amethyst v$(VERSION)] dep_mithril - installed from prebuilt/'; \
+	elif [ -f "$(SOURCEDIR)/Natives/resources/Frameworks/libmithril.dylib" ]; then \
+		echo '[Amethyst v$(VERSION)] dep_mithril - using existing Natives/resources/Frameworks/libmithril.dylib'; \
+	else \
+		echo '[Amethyst v$(VERSION)] dep_mithril - libmithril.dylib not found, Mithril renderer will be hidden'; \
+		echo '[Amethyst v$(VERSION)] dep_mithril - run scripts/fetch_mithril.sh to download it'; \
+	fi
 
 assets:
 	echo '[Amethyst v$(VERSION)] assets - start'
@@ -354,6 +439,10 @@ assets:
 
 payload: native dep_mg java jre assets
 	echo '[Amethyst v$(VERSION)] payload - start'
+	# Mithril / MobileGL 都是可选渲染器：这里用 - 前缀，任一失败都不阻断主构建。
+	# 缺库时对应渲染器会在设置里自动隐藏（见 LauncherPreferences.m 的存在性过滤）。
+	-$(MAKE) dep_mithril
+	-$(MAKE) dep_mobilegl
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo)
 	$(call METHOD_DIRCHECK,$(WORKINGDIR)/AngelAuraAmethyst.app/libs_caciocavallo17)

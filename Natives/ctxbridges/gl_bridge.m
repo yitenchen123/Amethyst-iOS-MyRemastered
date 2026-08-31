@@ -23,9 +23,14 @@ static void* load_egl_symbol(void *dl_handle, const char *symbol) {
 }
 
 static bool dlsym_EGL() {
-    // MobileGL 已移除，EGL 符号始终从 ANGLE（libtinygl4angle.dylib）解析。
+    // EGL 符号来源：
+    //   - Mithril / MobileGL：自带完整 EGL 实现，必须从自身 dylib 解析。
+    //     若复用 ANGLE 的 EGL，会创建 ANGLE 的 Metal 上下文而不是渲染器自己的
+    //     surface，且 eglChooseConfig 在这些渲染器请求的属性组合下可能返回 0
+    //     个配置，触发 gl_init_context 里的 assert(bundle->config) 崩溃。
+    //   - 其余渲染器（gl4es / ANGLE / MobileGlues / LTW）：仍从 ANGLE 解析。
     const char *renderer = getenv("AMETHYST_RENDERER");
-    const char *eglLibrary = RENDERER_NAME_MTL_ANGLE;
+    const char *eglLibrary = isSelfEglRenderer(renderer) ? renderer : RENDERER_NAME_MTL_ANGLE;
     NSString *eglPath = [NSString stringWithFormat:@"@rpath/%s", eglLibrary ?: ""];
     void* dl_handle = dlopen(eglPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
     if (!dl_handle) {
@@ -118,7 +123,10 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
     NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
-    BOOL angleDesktopGL = [renderer isEqualToString:@ RENDERER_NAME_MTL_ANGLE];
+    // ANGLE / Mithril / MobileGL 导出的都是 desktop OpenGL，走 EGL_OPENGL_BIT +
+    // eglBindAPI(EGL_OPENGL_API)；其余（gl4es / MobileGlues / LTW）是 OpenGL ES。
+    BOOL desktopGL = isDesktopGLRenderer(renderer.UTF8String);
+    BOOL mobileGL = isMobileGLRenderer(renderer.UTF8String);
 
     const EGLint attribs[] = {
         EGL_RED_SIZE, 8,
@@ -127,7 +135,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         EGL_ALPHA_SIZE, 8,
         EGL_DEPTH_SIZE, 24,
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT|EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, angleDesktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
+        EGL_RENDERABLE_TYPE, desktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
         EGL_NONE
     };
 
@@ -148,7 +156,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
 
     EGLBoolean bindResult;
-    if (angleDesktopGL) {
+    if (desktopGL) {
         NSDebugLog(@"EGLBridge: Binding to desktop OpenGL");
         bindResult = handle.eglBindAPI(EGL_OPENGL_API);
     } else {
@@ -158,7 +166,16 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     if (!bindResult) NSDebugLog(@"EGLBridge: bind failed: %p\n", handle.eglGetError());
 
     CALayer *layer = SurfaceViewController.surface.layer;
-    bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config, (__bridge EGLNativeWindowType)layer, NULL);
+    // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
+    // 像素宽高（乘 contentsScale，与 drawableSize 保持一致），否则 surface 会按
+    // 1x1 创建，进世界后画面异常。其余渲染器从 layer 自行推断，传 NULL。
+    const EGLint mobileGLSurfaceAttribs[] = {
+        EGL_WIDTH, (EGLint)MAX(1.0, round(layer.bounds.size.width * layer.contentsScale)),
+        EGL_HEIGHT, (EGLint)MAX(1.0, round(layer.bounds.size.height * layer.contentsScale)),
+        EGL_NONE
+    };
+    bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,
+        (__bridge EGLNativeWindowType)layer, mobileGL ? mobileGLSurfaceAttribs : NULL);
     if (!bundle->surface) {
         NSDebugLog(@"EGLBridge: eglCreateWindowSurface finished with error: 0x%x", handle.eglGetError());
         free(bundle);
@@ -169,8 +186,18 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
     };
+    // MobileGL 走真正的 desktop GL：要求 3.3 Core Profile。
+    // Mithril 同样导出 desktop GL 3.3 Core，但其 EGLConfig 已同时声明
+    // EGL_OPENGL_BIT | EGL_OPENGL_ES3_BIT，沿用 ES 版的 CLIENT_VERSION=3 即可
+    // （与 Uniaball 官方 launcher-patch 中验证过的配置保持一致）。
+    const EGLint desktop_ctx_attribs[] = {
+        EGL_CONTEXT_MAJOR_VERSION, 3,
+        EGL_CONTEXT_MINOR_VERSION, 3,
+        EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
+        EGL_NONE
+    };
     bundle->context = handle.eglCreateContext(g_EglDisplay, bundle->config, share ? share->context : EGL_NO_CONTEXT,
-        gles_ctx_attribs);
+        mobileGL ? desktop_ctx_attribs : gles_ctx_attribs);
     if (!bundle->context) {
         NSDebugLog(@"EGLBridge: Error eglCreateContext finished with error: 0x%x", handle.eglGetError());
         free(bundle);

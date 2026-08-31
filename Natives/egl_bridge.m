@@ -135,6 +135,25 @@ int pojavInitOpenGL() {
         NSLog(@"[egl_bridge] LTW renderer: preloading ANGLE as host EGL before LTW init");
         dlopen("@rpath/" RENDERER_NAME_MTL_ANGLE, RTLD_GLOBAL);
         set_gl_bridge_tbl();
+    } else if ([renderer isEqualToString:@ RENDERER_NAME_MITHRIL]) {
+        // Mithril 渲染器：EGL 1.5 + GL 3.3 Core 全部由 libmithril.dylib 提供
+        // （Vulkan backend，经 MoltenVK 到 Metal）。
+        // gl_bridge.m 的 dlsym_EGL() 会从 libmithril.dylib 解析 EGL 符号，
+        // gl_init_context 用 EGL_OPENGL_BIT + EGL_OPENGL_API 创建 desktop GL 上下文。
+        // 下方的统一逻辑会把它设为 LWJGL 的 opengl.libname 并 RTLD_GLOBAL 预加载。
+        NSLog(@"[egl_bridge] Mithril renderer: EGL/GL provided by libmithril.dylib (Vulkan backend)");
+        set_gl_bridge_tbl();
+    } else if (isMobileGLRenderer(renderer.UTF8String)) {
+        // MobileGL 渲染器：EGL + GL 由 libMobileGL.dylib 提供。
+        // 两个变体共用同一个二进制，用 MOBILEGL_BACKEND_TYPE 选择后端：
+        //   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
+        //   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
+        setenv("MOBILEGL_BACKEND_TYPE",
+            [renderer isEqualToString:@ RENDERER_NAME_MOBILEGL_GLES] ? "DirectGLES" : "DirectVulkan",
+            1);
+        NSLog(@"[egl_bridge] MobileGL renderer: backend=%s",
+            getenv("MOBILEGL_BACKEND_TYPE") ?: "<unset>");
+        set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"]) {
         setenv("GALLIUM_DRIVER","zink",1);
         set_osm_bridge_tbl();
@@ -173,6 +192,11 @@ int pojavInitOpenGL() {
         JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
         return !br_init();
+    }
+    if (!isMobileGLRenderer(renderer.UTF8String)) {
+        // 切换渲染器后清掉 MobileGL 专用环境变量，避免残留影响下一次启动
+        unsetenv("MOBILEGL_BACKEND_TYPE");
+        unsetenv("MOBILEGL_LOG_FILE_PATH");
     }
     if (strcmp(renderer.UTF8String, RENDERER_NAME_VULKAN) != 0) {
         JNI_LWJGL_changeRenderer(renderer.UTF8String);
