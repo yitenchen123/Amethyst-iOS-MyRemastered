@@ -108,10 +108,14 @@ MOLTENVK_LIBRARY      ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMoltenVK.d
 MOBILEGL_SOURCE_DIR   ?= $(SOURCEDIR)/Natives/external/MobileGL
 # MobileGL 源码已 vendoring 在 Natives/external/MobileGL（与 MobileGlues 一样是普通
 # 源码目录，不再是 gitlink），可以直接改源码调 iOS 构建。
-# 上游不发布 iOS 预编译产物，只能本地编译；编 glslang + SPIRV-Cross 很慢，
-# 故默认关闭，用 BUILD_MOBILEGL=1 显式开启（CI 上通过 repo variable 控制）。
+# 上游不发布 iOS 预编译产物。2026-08-31 首次编译成功（提交 55256e33），
+# 两个后端 dylib 已提交在 Natives/resources/Frameworks/ 下，日常构建直接用它，
+# 不必重编（编 glslang + SPIRV-Cross 约 30 分钟，Actions 对 macOS 按 10 倍计费）。
+# 改源码时才用 BUILD_MOBILEGL=1 重开。
 # 更新源码：Actions -> Vendor MobileGL sources -> Run workflow
 BUILD_MOBILEGL        ?= 0
+MOBILEGL_DYLIB        ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL.dylib
+MOBILEGL_GLES_DYLIB   ?= $(SOURCEDIR)/Natives/resources/Frameworks/libMobileGL-gles.dylib
 MITHRIL_PREBUILT_DIR  ?= $(SOURCEDIR)/prebuilt
 
 # Function to use later for checking dependencies
@@ -339,7 +343,12 @@ dep_mg:
 
 dep_mobilegl:
 	@if [ '$(BUILD_MOBILEGL)' != '1' ]; then \
-		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build from vendored source)'; \
+		if [ -f "$(MOBILEGL_DYLIB)" ] && [ -f "$(MOBILEGL_GLES_DYLIB)" ]; then \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - using prebuilt dylibs in Natives/resources/Frameworks/'; \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - (set BUILD_MOBILEGL=1 to rebuild from vendored source)'; \
+		else \
+			echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (set BUILD_MOBILEGL=1 to build from vendored source)'; \
+		fi; \
 	elif [ ! -d "$(MOBILEGL_SOURCE_DIR)" ]; then \
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
 	else \
@@ -365,7 +374,8 @@ dep_mobilegl:
 
 # MobileGL（MobileGL-Dev，LGPL-3.0）：
 # 2026-08-31 首次编译成功（libMobileGL.dylib / libMobileGL-gles.dylib），
-# 后续应把 dylib 提交进仓库并关掉 BUILD_MOBILEGL，改源码时才重开。：桌面 OpenGL 实现，两个后端共用同一个二进制：
+# 产物已提交进仓库（55256e33）并关掉 BUILD_MOBILEGL，改源码时才重开。
+# MobileGL 是桌面 OpenGL 实现，两个后端各一个二进制：
 #   libMobileGL.dylib      -> DirectVulkan (GL -> Vulkan -> MoltenVK -> Metal)
 #   libMobileGL-gles.dylib -> DirectGLES   (GL -> OpenGL ES)
 # 运行时由环境变量 MOBILEGL_BACKEND_TYPE 选择（见 Natives/JavaLauncher.m）。
