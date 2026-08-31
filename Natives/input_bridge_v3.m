@@ -719,19 +719,51 @@ int mcscale(CGFloat input) {
     return (int)((guiScale * input)/resolutionScale);
 }
 int callback_SurfaceViewController_touchHotbar(CGFloat x, CGFloat y) {
+    // 诊断：物品栏点不动时，靠这段代码一次性定位卡在哪一环。
+    // 可能的失败原因互不相关，只看现象无法区分：
+    //   1. isGrabbing 恒为 0 —— SDL3 下抓取状态没同步过来（最常见）
+    //   2. guiScale 卡在初始值 1 —— mcscale() 把命中区域缩小到约 60x6 像素
+    //   3. 传入坐标与 physicalWidth/Height 不同坐标系（rootView vs surfaceView）
+    //   4. resolutionScale 异常
+    // 限频：每 20 次打印一次，避免触摸时刷屏。
+    static int hotbarDiagCount = 0;
+    BOOL shouldLog = ((hotbarDiagCount++ % 20) == 0);
+
     if (isGrabbing == JNI_FALSE) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT isGrabbing=0 | x=%.1f y=%.1f | phys=%dx%d guiScale=%d resScale=%.2f sdlWin=%p",
+                  x, y, (int)physicalWidth, (int)physicalHeight, guiScale,
+                  (double)resolutionScale, g_sdlWindow);
+        }
         return -1;
     }
 
     int barHeight = mcscale(20);
     int barY = physicalHeight - barHeight;
-    if (y < barY) return -1;
+    if (y < barY) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT above bar | y=%.1f < barY=%d (barH=%d physH=%d guiScale=%d resScale=%.2f)",
+                  y, barY, barHeight, (int)physicalHeight, guiScale, (double)resolutionScale);
+        }
+        return -1;
+    }
 
     int barWidth = mcscale(180);
     int barX = (physicalWidth / 2) - (barWidth / 2);
-    if (x < barX || x >= barX + barWidth) return -1;
+    if (x < barX || x >= barX + barWidth) {
+        if (shouldLog) {
+            NSLog(@"[HotbarDiag] REJECT outside bar | x=%.1f not in [%d,%d) barW=%d physW=%d guiScale=%d resScale=%.2f",
+                  x, barX, barX + barWidth, barWidth, (int)physicalWidth, guiScale, (double)resolutionScale);
+        }
+        return -1;
+    }
 
-    return hotbarKeys[(int) MathUtils_map(x, barX, barX + barWidth, 0, 9)];
+    int slot = hotbarKeys[(int) MathUtils_map(x, barX, barX + barWidth, 0, 9)];
+    if (shouldLog) {
+        NSLog(@"[HotbarDiag] HIT slot key=%d | x=%.1f barX=%d barW=%d physW=%d guiScale=%d",
+              slot, x, barX, barWidth, (int)physicalWidth, guiScale);
+    }
+    return slot;
 }
 
 JNIEXPORT void JNICALL Java_net_kdt_pojavlaunch_uikit_UIKit_updateMCGuiScale(JNIEnv* env, jclass clazz, jint scale) {

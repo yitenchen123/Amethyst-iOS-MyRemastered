@@ -38,6 +38,21 @@ static bool amethyst_SDL_SetWindowRelativeMouseMode(void *window, bool enabled) 
     }
     return false;
 }
+
+// SDL3 有两套鼠标抓取 API，语义相近但入口不同：
+//   SDL_SetWindowRelativeMouseMode —— 相对模式（指针锁定，FPS 游戏视角控制）
+//   SDL_SetWindowMouseGrab         —— 窗口抓取（指针限制在窗口内）
+// 原先只拦了前者。若 MC 走的是后者，就完全拦不到，isGrabbing 会一直保持 0。
+// 两个都拦：同步函数内部有"状态未变化则跳过"的判断，重复调用无副作用。
+static bool (*g_real_SDL_SetWindowMouseGrab)(void *window, bool grabbed) = NULL;
+
+static bool amethyst_SDL_SetWindowMouseGrab(void *window, bool grabbed) {
+    CallbackBridge_syncGrabStateFromSDL(grabbed ? YES : NO, "SetWindowMouseGrab");
+    if (g_real_SDL_SetWindowMouseGrab) {
+        return g_real_SDL_SetWindowMouseGrab(window, grabbed);
+    }
+    return false;
+}
 int (*orig_open)(const char *path, int oflag, ...);
 
 /// 提供给 zink stride fix 使用的"绕过 hook"的 dlsym
@@ -1126,6 +1141,14 @@ void* hooked_dlsym(void* handle, const char* name) {
         NSLog(@"[InputDiag] dlsym intercepted: SDL_SetWindowRelativeMouseMode -> hook (real=%p)",
               (void *)g_real_SDL_SetWindowRelativeMouseMode);
         return (void *)amethyst_SDL_SetWindowRelativeMouseMode;
+    }
+    if (name != NULL && strcmp(name, "SDL_SetWindowMouseGrab") == 0) {
+        if (!g_real_SDL_SetWindowMouseGrab) {
+            g_real_SDL_SetWindowMouseGrab = (bool (*)(void *, bool))orig_dlsym(handle, name);
+        }
+        NSLog(@"[InputDiag] dlsym intercepted: SDL_SetWindowMouseGrab -> hook (real=%p)",
+              (void *)g_real_SDL_SetWindowMouseGrab);
+        return (void *)amethyst_SDL_SetWindowMouseGrab;
     }
     // 诊断：记录 MC 查询了哪些其它 SDL 鼠标/抓取相关 API，便于判断它实际用了哪条路径
     if (name != NULL && strncmp(name, "SDL_Set", 7) == 0 &&
