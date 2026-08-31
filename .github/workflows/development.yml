@@ -83,33 +83,14 @@ jobs:
           GIT_LFS_SKIP_SMUDGE: "1"
         run: git submodule update --init --recursive
 
-      # ---- optional renderers: Mithril (prebuilt) and MobileGL (from source) ----
-      # Both are no-ops by default and cannot slow down or break the normal build:
-      #   - Mithril needs a cross-repo artifact download, gated on MITHRIL_FETCH_TOKEN
-      #   - MobileGL needs cloning upstream sources, gated on repo variable BUILD_MOBILEGL
-      # If either is missing, the renderer is simply hidden in Settings
-      # (LauncherPreferences.m filters by dylib existence).
       # 注意：不要在 `if:` 条件里引用 secrets / vars。
       # GitHub Actions 的表达式求值器在编译 workflow 时处理这些 context，
-      # secrets 在 if: 中不受官方支持，vars 在仓库尚未创建任何 variable 时
-      # 求值也会失败 —— 两种情况都会让整个 workflow 编译失败，
-      # 表现为 run 直接 failure 且没有任何 job（jobs API total_count=0、
-      # 日志 404）。判断逻辑一律放进 shell，env: 里引用是安全的标准用法。
-      - name: Fetch Mithril renderer (optional)
-        env:
-          MITHRIL_ARTIFACT_ID: ${{ vars.MITHRIL_ARTIFACT_ID }}
-          MITHRIL_FETCH_TOKEN: ${{ secrets.MITHRIL_FETCH_TOKEN }}
-        run: |
-          set -eu
-          if [ -z "${MITHRIL_ARTIFACT_ID:-}" ] || [ -z "${MITHRIL_FETCH_TOKEN:-}" ]; then
-            echo "Mithril not configured (needs repo variable MITHRIL_ARTIFACT_ID + secret MITHRIL_FETCH_TOKEN); skipping"
-            exit 0
-          fi
-          GITHUB_TOKEN="$MITHRIL_FETCH_TOKEN" ARTIFACT_ID="$MITHRIL_ARTIFACT_ID" \
-            sh scripts/fetch_mithril.sh || {
-            echo "::warning::Mithril download failed; this build has no Mithril renderer"
-          }
-
+      # vars 在仓库尚未创建任何 variable 时求值也会失败，导致整个 workflow
+      # 编译失败（表现为 run 直接 failure、jobs total_count=0、日志 404）。
+      # 判断逻辑一律放进 shell，env: 里引用是安全的标准用法。
+      #
+      # Mithril 不需要下载步骤：libmithril.dylib 已提交在
+      # Natives/resources/Frameworks/ 下，随 Natives/resources/* 一起打包。
       - name: Fetch MobileGL source (optional)
         env:
           GIT_LFS_SKIP_SMUDGE: "1"

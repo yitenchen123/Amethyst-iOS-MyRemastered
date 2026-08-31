@@ -416,10 +416,11 @@ dep_mobilegl_build:
 	echo '[Amethyst v$(VERSION)] dep_mobilegl - end'
 
 # Mithril（Uniaball/Mithril-Wrapper）：OpenGL 3.3 Core -> Vulkan -> MoltenVK -> Metal。
-# 与 MobileGL 不同，Mithril 有 CI 产出的预编译 libmithril.dylib，直接放进
-# Natives/resources/Frameworks/ 即可（payload 的 cp -R Natives/resources/* 会自动打包）。
-# 用 scripts/fetch_mithril.sh 下载；本目标只是把它从 prebuilt/ 落位并给出明确提示，
-# 缺失时只告警不失败——Mithril 是可选渲染器，不该阻断主构建。
+# 与 MobileGL 不同，Mithril 只发布预编译 dylib，本仓库不从源码编译。
+# libmithril.dylib 已提交在 Natives/resources/Frameworks/ 下，payload 的
+# `cp -R Natives/resources/*` 会自动把它打进 app 的 Frameworks 目录。
+# 本目标只做存在性检查并给出提示；缺失时只告警不失败 —— Mithril 是可选渲染器，
+# 且 LauncherPreferences.m 已按 dylib 是否存在决定是否显示该选项。
 dep_mithril:
 	if [ -f "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" ]; then \
 		cp "$(MITHRIL_PREBUILT_DIR)/libmithril.dylib" $(SOURCEDIR)/Natives/resources/Frameworks/libmithril.dylib; \
