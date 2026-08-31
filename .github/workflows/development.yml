@@ -64,17 +64,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Remove stale MobileGL gitlink
-        # MobileGL submodule 已完整移除（.gitmodules 中无对应条目），
-        # 但并行 agent 操作或本地 index 残留可能反复引入孤立 gitlink，
-        # 导致后续 git submodule update --init 因找不到 URL 而 exit 128。
-        # checkout 后、submodule 初始化前强制清理。
-        # MobileGlues submodule 同样已移除（源码直接内嵌仓库，对齐 Ynnyny）。
+      - name: Drop stale submodule gitlinks
+        # 历史遗留：MobileGL 曾以 submodule 方式接入，上游 force push 导致 pinned
+        # commit 消失、孤立 gitlink 被反复引入，当时靠这个步骤清理。
+        # MobileGL 现在与 MobileGlues 一样是 vendored 源码目录（见
+        # .github/workflows/vendor-mobilegl.yml），不再是 gitlink。
+        # 因此这里只在 git ls-files -s 显示 mode 160000（确实是 gitlink）时才清理，
+        # 避免把 vendored 的真实源码目录从索引里删掉。
         run: |
-          git rm --cached -f Natives/external/MobileGL 2>/dev/null || true
-          git config --remove-section submodule.Natives/external/MobileGL 2>/dev/null || true
-          git rm --cached -f Natives/external/MobileGlues 2>/dev/null || true
-          git config --remove-section submodule.Natives/external/MobileGlues 2>/dev/null || true
+          for p in Natives/external/MobileGL Natives/external/MobileGlues; do
+            mode=$(git ls-files -s -- "$p" 2>/dev/null | awk '{print $1}')
+            if [ "$mode" = "160000" ]; then
+              echo "dropping stale gitlink: $p"
+              git rm --cached -f "$p" || true
+              git config --remove-section "submodule.$p" 2>/dev/null || true
+            else
+              echo "$p is a regular path (mode=${mode:-none}), keeping"
+            fi
+          done
 
       - name: Checkout repository submodules
         env:
