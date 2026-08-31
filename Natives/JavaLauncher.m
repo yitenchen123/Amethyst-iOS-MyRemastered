@@ -379,6 +379,33 @@ static NSString *ResolveLwjglVersion(NSString *profileValue, NSString *mcVersion
     return @"333";
 }
 
+// 把 "libXxx.dylib" 形式的磁盘文件名转成 LWJGL 期望的"裸名"（"Xxx"）。
+//
+// LWJGL 加载 native 库时（Platform.mapLibraryName 的 macOS 分支）先用正则
+//     (?:^|/)lib\w+(?:[.]\d+)*[.]dylib$
+// 判断传入的 libname 是否"已经是 dylib 文件名"：是则原样使用，否则交给
+// System.mapLibraryName 补 "lib" 前缀与 ".dylib" 后缀。
+//
+// 问题在 \w 不含连字符：像 "libMobileGL-gles.dylib" 这种带 '-' 的文件名反而不匹配该
+// 正则，被当成裸名再补一层 -> "liblibMobileGL-gles.dylib.dylib"，磁盘上没有这个文件，
+// 于是 UnsatisfiedLinkError。名字里没有连字符的库（mobileglues / OSMesa.8 / gl4es_114
+// / MobileGL / MoltenVK 等）恰好都能匹配，所以长期只有 GLES 这一个库受影响。
+//
+// 传裸名则一定安全：裸名不以 "lib" 开头，必定不匹配该正则，统一走 System.mapLibraryName
+// 补回前缀后缀，结果与磁盘文件名逐字一致，且不依赖文件名里是否有特殊字符。
+static NSString *lwjglBareLibName(const char *fileName) {
+    if (fileName == NULL) {
+        return nil;
+    }
+    NSString *name = [NSString stringWithUTF8String:fileName];
+    // "lib".length == 3，".dylib".length == 6，合计 9。
+    if (name.length > 9 && [name hasPrefix:@"lib"] && [name hasSuffix:@".dylib"]) {
+        return [name substringWithRange:NSMakeRange(3, name.length - 9)];
+    }
+    // 不是标准命名（例如别名）就原样返回，保持原有行为。
+    return name;
+}
+
 int launchJVM(NSString *accountId, id launchTarget, int width, int height, int minVersion) {
     NSLog(@"[JavaLauncher] Beginning JVM launch");
 
@@ -835,7 +862,26 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             ? RENDERER_NAME_MOBILEGLUES
             : glLibName;
 
-        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibName);
+        // 关键修复（libMobileGL-gles 加载失败）：这里必须传"裸名"，不能传完整文件名。
+        //
+        // LWJGL 的 Platform.mapLibraryName（macOS 分支）先用一个正则判断名字是否"已经是
+        // dylib 文件名"，是则原样返回，否则交给 System.mapLibraryName 补 "lib" 前缀和
+        // ".dylib" 后缀：
+        //     private final Pattern DYLIB =
+        //         Pattern.compile("(?:^|/)lib\\w+(?:[.]\\d+)*[.]dylib$");
+        //     if (DYLIB.matcher(name).find()) return name;
+        //     return System.mapLibraryName(name);
+        //
+        // \w 不含连字符，所以 "libMobileGL-gles.dylib" 不匹配该正则（"lib"+\w+ 在 '-' 处
+        // 断开），被误判为需要补前缀后缀 -> "liblibMobileGL-gles.dylib.dylib"，文件不存在
+        // -> UnsatisfiedLinkError。其余渲染器名（mobileglues / OSMesa.8 / gl4es_114 /
+        // MobileGL / MoltenVK）都能匹配，所以只有 GLES 这个带连字符的库名中招。
+        //
+        // 传裸名（去掉 "lib" 前缀与 ".dylib" 后缀）对全部渲染器都成立：裸名一定不匹配
+        // DYLIB 正则（开头不是 lib），于是统一走 System.mapLibraryName 补回，得到与磁盘
+        // 完全一致的文件名。
+        NSString *openglLibBareName = lwjglBareLibName(openglLibName);
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.opengl.libname=%s", openglLibBareName.UTF8String);
 
         // 关键修复（参照 FCL，阶段4：26.2 图形 API 切换无效）：
         // 之前仅在 renderer=libMoltenVK.dylib 时由 PojavLauncher.java 通过 System.setProperty 设置
@@ -845,12 +891,19 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // FCL 做法：在 JVM 启动前通过 -D 系统属性同时确定 OpenGL 和 Vulkan 两条路径的 native 库，
         // 无论 MC 最终选哪条路都能找到对应的库。
         //
-        // 传裸名 "MoltenVK"，LWJGL Library.loadNative 会自动加 "lib" 前缀和 ".dylib" 后缀，
-        // 得到 "libMoltenVK.dylib"（正确文件名）。若传 "libMoltenVK.dylib" 会被包装成
-        // "liblibMoltenVK.dylib.dylib"（错误文件名）。
+        // 传裸名（由 lwjglBareLibName 从 RENDERER_NAME_VULKAN 剥出 "MoltenVK"）：裸名不匹配
+        // LWJGL 的 DYLIB 正则，必定走 System.mapLibraryName 补回 "lib" 前缀与 ".dylib" 后缀，
+        // 得到 "libMoltenVK.dylib"。
+        //
+        // 顺便修正此处原有注释：它声称传 "libMoltenVK.dylib" 会被二次包装成
+        // "liblibMoltenVK.dylib.dylib" —— 实际上 "libMoltenVK.dylib" 是匹配 DYLIB 正则的，
+        // 原样返回并不会被二次包装（日志中 Vulkan 正常加载即为佐证）。真正会中招的是
+        // 名字含连字符的库（见上方 opengl.libname 的修复）。改传裸名是为了与 opengl 侧
+        // 统一口径，也让规则对任何文件名都成立。
         //
         // 安全性：即使 MC 最终走 GL 路径，加载 MoltenVK 也无副作用（GL 路径不调用 Vulkan 入口）。
-        PUSH_MARGV_LITERAL("-Dorg.lwjgl.vulkan.libname=libMoltenVK.dylib");
+        PUSH_MARGV_FORMAT(@"-Dorg.lwjgl.vulkan.libname=%s",
+                          lwjglBareLibName(RENDERER_NAME_VULKAN).UTF8String);
 
         // 显式指定 spirv-cross 库名（参照 catsruledogs/Amethyst-iOS-25）：
         // LWJGL spvc 模块默认查找 "spirv-cross" -> 加载 libspirv-cross.dylib（macOS 标准名），
