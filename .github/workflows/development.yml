@@ -214,7 +214,7 @@ jobs:
       # release asset 链接长期固定，便于挂代理/镜像加速（国内直连 GitHub 很慢）。
       # 每次先删除同名 release，保证始终只有一个 nightly、链接地址不变。
       - name: Publish nightly release
-        if: matrix.platform_name == 'ios' && success() && github.event_name == 'push' && github.ref == 'refs/heads/feat/sdl3'
+        if: matrix.platform_name == 'ios' && success() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/feat/sdl3'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
