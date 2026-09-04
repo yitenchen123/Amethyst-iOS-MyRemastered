@@ -1601,6 +1601,21 @@ static UIView *findSDL_uikitview(UIView *root);
                                              selector:@selector(onFirstFrameRendered)
                                                  name:@"PojavFirstFrameRendered"
                                                object:nil];
+
+    // 兜底：关闭 SDL GL bridge 后，GL 上下文由 SDL 自行管理，egl_bridge 的
+    // pojavSwapBuffers 不再被调用，"PojavFirstFrameRendered" 永远不会发出，
+    // 遮罩就会一直盖住画面，看起来像卡死（实测导致用户误判并手动取消启动）。
+    // 这里加一个宽松的超时，到点直接移除遮罩 —— 遮罩只是加载提示，
+    // 不该成为进入游戏的门槛。
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf || strongSelf.launchOverlayDismissed) return;
+        NSLog(@"[SurfaceViewController] Launch overlay timeout after 45s: "
+              @"no PojavFirstFrameRendered received (SDL owns the GL context; "
+              @"egl_bridge swap is not used). Dismissing overlay so it cannot block gameplay.");
+        [strongSelf dismissLaunchOverlayOnError];
+    });
 }
 
 /// 取消启动：用户点击"取消启动"按钮时调用。
