@@ -457,8 +457,15 @@ static void ame_SDL_UnloadObject(void *handle) {
 // 判定复用 ame_sdlGlesCompatEnabled()：它已排除 zink（libOSMesa/gallium_/
 // vulkan_zink）与原生 Vulkan（libMoltenVK），因此 zink 在 26.3 上"回落 Vulkan"
 // 那条已验证可用的路径不会受到任何影响。
+//
+// 默认关闭（实测结论）：接管后 MC 走 OpenGL 后端，会要求渲染器以桌面 GL 提供
+// 上下文（MobileGL 对外声明 4.6），由此生成的桌面 GLSL 经 shaderc/glslang 编译
+// 时稳定崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致）。
+// 不接管时 MC 回落 Vulkan（MoltenVK）可正常加载资源并进入世界。
+// 因此在修复 glslang 桌面 GLSL 路径之前默认不接管；需要继续试验时可用
+// AMETHYST_SDL_GL_BRIDGE=1 打开。
 static bool ame_glBridgeEnabled(void) {
-    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", true)) return false;
+    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", false)) return false;
 
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return false;
