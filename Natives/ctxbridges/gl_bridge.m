@@ -128,6 +128,23 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     BOOL desktopGL = isDesktopGLRenderer(renderer.UTF8String);
     BOOL mobileGL = isMobileGLRenderer(renderer.UTF8String);
 
+    // 诊断开关：把 MobileGL 从 desktop GL 上下文切到 ES3 上下文。
+    // 依据：ZL2 在安卓上建窗前强制 ES profile，MC 因此生成 GLSL ES，走 glslang
+    // 里最成熟的 ES->SPIR-V 路径，MobileGL 从不出问题；而 iOS 侧桥硬编码了
+    // desktop GL 3.3 Core，MC 改发桌面 GLSL，其 desktop->SPIR-V 路径会在
+    // TGlslangToSpvTraverser::visitAggregate 确定性崩溃（压并发无效，地址不变）。
+    // 仅影响 MobileGL，Mithril/ANGLE/gl4es 等保持原行为。
+    BOOL useDesktopCtx = mobileGL;
+    NSString *forceES = NSProcessInfo.processInfo.environment[@"AMETHYST_EGL_FORCE_ES"];
+    if (forceES && ([forceES isEqualToString:@"1"] ||
+                    [forceES caseInsensitiveCompare:@"yes"] == NSOrderedSame)) {
+        if (mobileGL) {
+            desktopGL = NO;
+            useDesktopCtx = NO;
+            NSDebugLog(@"EGLBridge: AMETHYST_EGL_FORCE_ES=1 -> using ES3 context for MobileGL");
+        }
+    }
+
     const EGLint attribs[] = {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
@@ -197,7 +214,7 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         EGL_NONE
     };
     bundle->context = handle.eglCreateContext(g_EglDisplay, bundle->config, share ? share->context : EGL_NO_CONTEXT,
-        mobileGL ? desktop_ctx_attribs : gles_ctx_attribs);
+        useDesktopCtx ? desktop_ctx_attribs : gles_ctx_attribs);
     if (!bundle->context) {
         NSDebugLog(@"EGLBridge: Error eglCreateContext finished with error: 0x%x", handle.eglGetError());
         free(bundle);
