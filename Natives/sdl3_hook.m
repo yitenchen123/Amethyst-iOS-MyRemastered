@@ -458,14 +458,23 @@ static void ame_SDL_UnloadObject(void *handle) {
 // vulkan_zink）与原生 Vulkan（libMoltenVK），因此 zink 在 26.3 上"回落 Vulkan"
 // 那条已验证可用的路径不会受到任何影响。
 //
-// 默认关闭（实测结论）：接管后 MC 走 OpenGL 后端，会要求渲染器以桌面 GL 提供
-// 上下文（MobileGL 对外声明 4.6），由此生成的桌面 GLSL 经 shaderc/glslang 编译
-// 时稳定崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致）。
-// 不接管时 MC 回落 Vulkan（MoltenVK）可正常加载资源并进入世界。
-// 因此在修复 glslang 桌面 GLSL 路径之前默认不接管；需要继续试验时可用
-// AMETHYST_SDL_GL_BRIDGE=1 打开。
+// 默认开启：接管后 MC 走 OpenGL 后端，渲染器以其声明的 GL 版本（MobileGL 对外
+// 声明 4.6）提供上下文。
+//
+// 曾默认关闭（实测结论）：接管后生成的桌面 GLSL 经 shaderc/glslang 编译时稳定
+// 崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致在
+// libshaderc.dylib +0x155820）。
+//
+// 关闭期间定位到诱因：libMobileGL.dylib 与 libshaderc.dylib 各含一份 glslang，
+// 前者以 RTLD_GLOBAL 载入时其 N_WEAK_DEF glslang 符号进入全局空间，被后者合并，
+// 二者共用线程局部 AST 内存池，MobileGL 销毁 TShader 时连带回收了 shaderc 仍在
+// 遍历的 AST 节点 -> 访问已释放内存。现两处 dlopen 对 MobileGL 改用 RTLD_LOCAL
+// 隔离符号（见 gl_bridge.m / egl_bridge.m），故重新默认开启。
+//
+// 若实测仍崩溃，可用 AMETHYST_SDL_GL_BRIDGE=0 回到"不接管 -> 回落 Vulkan"这条
+// 已验证可进世界的路径，无需重新构建。
 static bool ame_glBridgeEnabled(void) {
-    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", false)) return false;
+    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", true)) return false;
 
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return false;
