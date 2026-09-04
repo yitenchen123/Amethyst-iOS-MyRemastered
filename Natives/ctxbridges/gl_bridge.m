@@ -32,7 +32,27 @@ static bool dlsym_EGL() {
     const char *renderer = getenv("AMETHYST_RENDERER");
     const char *eglLibrary = isSelfEglRenderer(renderer) ? renderer : RENDERER_NAME_MTL_ANGLE;
     NSString *eglPath = [NSString stringWithFormat:@"@rpath/%s", eglLibrary ?: ""];
-    void* dl_handle = dlopen(eglPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    //
+    // MobileGL 以 RTLD_LOCAL 载入（参照 MojoLauncher mojoexec_acq_egl_handle() 的
+    // RTLD_LOCAL | RTLD_NOW）：
+    //
+    // libMobileGL.dylib 镜像内静态链接了一份 glslang。以 RTLD_GLOBAL 载入时，其中
+    // 大量 N_WEAK_DEF 符号会被提升进全局符号空间；随后 LWJGL 加载 libshaderc.dylib
+    // 时，dyld 把 shaderc 那份 glslang 合并到 MobileGL 这份上，二者共用线程局部的
+    // AST 内存池 —— MobileGL 销毁自己的 TShader 时会连带回收 shaderc 仍在使用的
+    // AST 节点，TGlslangToSpvTraverser::visitAggregate 随即解引用到已释放内存
+    // （SIGSEGV；26.3 上崩溃地址固定在 +0x155820，多次复现完全一致）。
+    //
+    // EGL 符号一律通过本函数持有的 dl_handle 显式 dlsym 解析（load_egl_symbol 用
+    // dlsym(dl_handle, ...) 而非 RTLD_DEFAULT），因此 RTLD_LOCAL 不影响解析。
+    //
+    // ANGLE 作为多个渲染器共享的 EGL host 仍保持 RTLD_GLOBAL，行为不变。
+    // 逃生开关：AMETHYST_MOBILEGL_RTLD_GLOBAL=1 可恢复旧行为，无需重新构建。
+    const char *forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+    bool useLocalEGL = isMobileGLRenderer(renderer) &&
+                       !(forceGlobal && forceGlobal[0] == '1');
+    int eglDlFlags = RTLD_NOW | (useLocalEGL ? RTLD_LOCAL : RTLD_GLOBAL);
+    void* dl_handle = dlopen(eglPath.UTF8String, eglDlFlags);
     if (!dl_handle) {
         NSLog(@"EGLBridge: failed to load %@ for renderer %s: %s",
             eglPath, renderer ?: "<unset>", dlerror() ?: "unknown dlopen error");
@@ -94,6 +114,9 @@ static bool dlsym_EGL() {
     handle.eglSwapInterval = load_egl_symbol(dl_handle, "eglSwapInterval");
     handle.eglTerminate = load_egl_symbol(dl_handle, "eglTerminate");
     handle.eglGetCurrentSurface = load_egl_symbol(dl_handle, "eglGetCurrentSurface");
+
+    NSLog(@"EGLBridge: loaded %@ with %s for renderer %s",
+          eglPath, useLocalEGL ? "RTLD_LOCAL" : "RTLD_GLOBAL", renderer ?: "<unset>");
 
     return handle.eglBindAPI && handle.eglChooseConfig && handle.eglCreateContext &&
         handle.eglCreateWindowSurface && handle.eglDestroyContext && handle.eglDestroySurface &&
