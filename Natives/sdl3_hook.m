@@ -168,6 +168,17 @@ static bool ame_sdlGlesCompatEnabled(void) {
 
 static bool ame_forcedEsProfile = false;
 
+// SDL3 路径下"最终想要的"上下文语义，供 EGL bridge 决策（见文件末尾的
+// amethyst_sdl3_wants_gles_context()）。
+//
+// 为什么需要它：ZL2 的 forceEglProfileEs() 只调 SDL_GL_SetAttribute(ES)，
+// 随后由 SDL 自己的 EGL 后端按该属性建上下文，因此"强制"天然生效。
+// 而 iOS 侧 SDL_GL_CreateContext 被本模块接管并转交 EGL bridge（见 5)），
+// SDL 内部的属性状态对最终上下文不再有任何影响 —— 这正是此前
+// "forced ... = ES" 打了日志、桥却照旧打印 "Binding to desktop OpenGL" 的原因。
+// 故在此记下强制结果，让 gl_bridge.m 能按它选择 ES / desktop。
+static bool ame_sdl3WantsGles = false;
+
 static void ame_forceEglProfileEs(void) {
     if (!ame_sdlGlesCompatEnabled()) return;
     if (ame_real_GL_SetAttribute == NULL) {
@@ -176,6 +187,7 @@ static void ame_forceEglProfileEs(void) {
     if (ame_real_GL_SetAttribute != NULL) {
         ame_real_GL_SetAttribute(AME_SDL_GL_CONTEXT_PROFILE_MASK, AME_SDL_GL_CONTEXT_PROFILE_ES);
         ame_forcedEsProfile = true;
+        ame_sdl3WantsGles = true;
         NSDebugLog(@"[SDLHook] forced SDL_GL_CONTEXT_PROFILE_MASK = ES");
     } else {
         NSDebugLog(@"[SDLHook] SDL_GL_SetAttribute unresolved, cannot force ES profile");
@@ -630,6 +642,18 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
+
+#pragma mark - 供 EGL bridge 查询的上下文语义
+
+/// SDL3 路径下，建窗前是否已把 GL profile 强制为 ES（ZL2 的 forceEglProfileEs
+/// 在 iOS 上的等价物，见本文件 1)）。
+///
+/// 仅当本模块接管了 SDL GL 入口（即走 EGL bridge 的转译型渲染器）时才可能为
+/// true；GLFW 老路径（MC 26.2 及以下）根本不经过这里，恒为 false，因此
+/// MobileGL 在老路径上仍走已验证可用的 desktop GL 3.3 Core 上下文。
+bool amethyst_sdl3_wants_gles_context(void) {
+    return ame_sdl3WantsGles && ame_glBridgeEnabled();
+}
 
     // SDL GL 上下文接管（MobileGL / Mithril / MobileGlues / gl4es / LTW）
     if (ame_glBridgeEnabled()) {
