@@ -266,7 +266,24 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         JNI_LWJGL_changeRenderer(renderer.UTF8String);
     }
     // Preload renderer library
-    dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, RTLD_GLOBAL);
+    //
+    // MobileGL 用 RTLD_LOCAL，其余渲染器保持 RTLD_GLOBAL（GLFW 路径的历史行为）。
+    // 完整理由见 gl_bridge.m 的 dlsym_EGL()：要点是阻止 libMobileGL.dylib 内置的
+    // glslang 弱符号进入全局符号空间，避免与 libshaderc.dylib 那份合并后共用 AST
+    // 内存池（合并会导致 visitAggregate 访问已回收节点而 SIGSEGV）。
+    {
+        const char *forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+        bool useLocal = isMobileGLRenderer(renderer.UTF8String) &&
+                        !(forceGlobal && forceGlobal[0] == '1');
+        int dlFlags = useLocal ? RTLD_LOCAL : RTLD_GLOBAL;
+        NSDebugLog(@"[egl_bridge] preloading %@ with %s", renderer,
+                   useLocal ? "RTLD_LOCAL" : "RTLD_GLOBAL");
+        if (useLocal) {
+            NSLog(@"[egl_bridge] MobileGL loaded with RTLD_LOCAL "
+                  @"(glslang symbols isolated from libshaderc.dylib)");
+        }
+        dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, dlFlags);
+    }
 
     return pojavFinishOpenGLInit(!br_init());
     //return 0;
