@@ -642,19 +642,6 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
-
-#pragma mark - 供 EGL bridge 查询的上下文语义
-
-/// SDL3 路径下，建窗前是否已把 GL profile 强制为 ES（ZL2 的 forceEglProfileEs
-/// 在 iOS 上的等价物，见本文件 1)）。
-///
-/// 仅当本模块接管了 SDL GL 入口（即走 EGL bridge 的转译型渲染器）时才可能为
-/// true；GLFW 老路径（MC 26.2 及以下）根本不经过这里，恒为 false，因此
-/// MobileGL 在老路径上仍走已验证可用的 desktop GL 3.3 Core 上下文。
-bool amethyst_sdl3_wants_gles_context(void) {
-    return ame_sdl3WantsGles && ame_glBridgeEnabled();
-}
-
     // SDL GL 上下文接管（MobileGL / Mithril / MobileGlues / gl4es / LTW）
     if (ame_glBridgeEnabled()) {
         if (strcmp(name, "SDL_GL_LoadLibrary") == 0) {
@@ -706,4 +693,16 @@ bool amethyst_sdl3_wants_gles_context(void) {
     }
 
     return NULL;
+}
+
+#pragma mark - 供 EGL bridge 查询的上下文语义
+
+/// SDL3 路径下，建窗前是否已把 GL profile 强制为 ES（ZL2 的 forceEglProfileEs
+/// 在 iOS 上的等价物，见本文件 1)）。
+///
+/// 仅当本模块接管了 SDL GL 入口（即走 EGL bridge 的转译型渲染器）时才可能为
+/// true；GLFW 老路径（MC 26.2 及以下）根本不经过这里，恒为 false，因此
+/// MobileGL 在老路径上仍走已验证可用的 desktop GL 3.3 Core 上下文。
+bool amethyst_sdl3_wants_gles_context(void) {
+    return ame_sdl3WantsGles && ame_glBridgeEnabled();
 }
