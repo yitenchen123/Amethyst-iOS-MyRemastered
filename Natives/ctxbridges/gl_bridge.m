@@ -119,6 +119,10 @@ static bool gl_init() {
     return true;
 }
 
+/// sdl3_hook.m 导出：SDL3 路径下建窗前是否已把 GL profile 强制为 ES。
+/// 非 SDL3 路径（GLFW / MC 26.2 及以下）恒返回 false。
+extern bool amethyst_sdl3_wants_gles_context(void);
+
 gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
@@ -128,21 +132,45 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     BOOL desktopGL = isDesktopGLRenderer(renderer.UTF8String);
     BOOL mobileGL = isMobileGLRenderer(renderer.UTF8String);
 
-    // 诊断开关：把 MobileGL 从 desktop GL 上下文切到 ES3 上下文。
+    // MobileGL 的上下文语义：desktop GL 3.3 Core 还是 ES3。
+    //
     // 依据：ZL2 在安卓上建窗前强制 ES profile，MC 因此生成 GLSL ES，走 glslang
-    // 里最成熟的 ES->SPIR-V 路径，MobileGL 从不出问题；而 iOS 侧桥硬编码了
-    // desktop GL 3.3 Core，MC 改发桌面 GLSL，其 desktop->SPIR-V 路径会在
+    // 里最成熟的 ES->SPIR-V 路径，MobileGL 从不出问题；而 iOS 侧桥按
+    // isDesktopGLRenderer() 把 MobileGL 归为 desktop，硬编码建 desktop GL 3.3
+    // Core 上下文，MC 改发桌面 GLSL，其 desktop->SPIR-V 路径会在
     // TGlslangToSpvTraverser::visitAggregate 确定性崩溃（压并发无效，地址不变）。
-    // 仅影响 MobileGL，Mithril/ANGLE/gl4es 等保持原行为。
+    //
+    // 三档优先级：
+    //   1) AMETHYST_EGL_FORCE_ES 显式指定时以其为准（排障用，可强制回退）
+    //   2) 否则跟随 SDL3 路径的 ZL2 式 ES 强制（sdl3_hook.m 建窗前写入）
+    //   3) 都不是则沿用 desktop（GLFW 老路径恒走这条，行为不变）
+    //
+    // 仅影响 MobileGL；Mithril / ANGLE / gl4es 等完全不受影响。
     BOOL useDesktopCtx = mobileGL;
+
     NSString *forceES = NSProcessInfo.processInfo.environment[@"AMETHYST_EGL_FORCE_ES"];
-    if (forceES && ([forceES isEqualToString:@"1"] ||
-                    [forceES caseInsensitiveCompare:@"yes"] == NSOrderedSame)) {
-        if (mobileGL) {
-            desktopGL = NO;
-            useDesktopCtx = NO;
-            NSDebugLog(@"EGLBridge: AMETHYST_EGL_FORCE_ES=1 -> using ES3 context for MobileGL");
+    NSInteger forced = 0;  // 0=未指定 1=强制ES -1=强制desktop
+    if (forceES != nil) {
+        if ([forceES isEqualToString:@"1"] ||
+            [forceES caseInsensitiveCompare:@"yes"] == NSOrderedSame) {
+            forced = 1;
+        } else if ([forceES isEqualToString:@"0"] ||
+                   [forceES caseInsensitiveCompare:@"no"] == NSOrderedSame) {
+            forced = -1;
         }
+    }
+
+    // SDL3 路径下 sdl3_hook 是否已把 profile 强制为 ES。GLFW 老路径（26.2 及
+    // 以下）不会经过该 hook，恒为 NO —— MobileGL 在老路径上保持原有
+    // desktop GL 行为，不受本次改动影响。
+    BOOL sdl3WantsEs = amethyst_sdl3_wants_gles_context();
+
+    BOOL wantES = (forced == 1) ? YES : (forced == -1) ? NO : sdl3WantsEs;
+    if (wantES && mobileGL) {
+        desktopGL = NO;
+        useDesktopCtx = NO;
+        NSDebugLog(@"EGLBridge: ES3 context for MobileGL (sdl3Forced=%d, envForced=%ld)",
+                   (int)sdl3WantsEs, (long)forced);
     }
 
     const EGLint attribs[] = {
