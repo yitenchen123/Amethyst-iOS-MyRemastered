@@ -1215,6 +1215,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             // LWJGL 实际加载的是 MobileGlues。
             preloadName = RENDERER_NAME_MOBILEGLUES;
         }
+        // 逃生开关：置 0 时整个预载跳过，回到「由 LWJGL 自行 dlopen」的旧行为。
+        // 低版本（如 1.21.1）手动选用 MobileGlues 时若出现与隔离相关的回归，
+        // 可用此变量即时关闭，无需等待下一次构建。
+        const char *isolateOff = getenv("AMETHYST_PRELOAD_ISOLATE");
+        const BOOL preloadIsolateDisabled = (isolateOff != NULL && isolateOff[0] == '0');
         if (preloadName != NULL && preloadName[0] != '\0') {
             const char *forceGlobal = getenv("AMETHYST_RENDERER_RTLD_GLOBAL");
             if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
@@ -1223,7 +1228,11 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
             const BOOL needsGlobalSymbols =
                 strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
                 strncmp(preloadName, "libOSMesa", 9) == 0;
-            if (!needsGlobalSymbols && !(forceGlobal != NULL && forceGlobal[0] == '1')) {
+            const BOOL forceGlobalSymbols = (forceGlobal != NULL && forceGlobal[0] == '1');
+            if (preloadIsolateDisabled) {
+                NSLog(@"[JavaLauncher] renderer preload skipped: AMETHYST_PRELOAD_ISOLATE=0 (%s)",
+                      preloadName);
+            } else if (!needsGlobalSymbols && !forceGlobalSymbols) {
                 NSString *absPath = [NSString stringWithFormat:@"%@/%s", frameworksPath, preloadName];
                 void *handle = dlopen(absPath.UTF8String, RTLD_LOCAL);
                 NSLog(@"[JavaLauncher] preloaded %s with RTLD_LOCAL before JVM start (%s)",
