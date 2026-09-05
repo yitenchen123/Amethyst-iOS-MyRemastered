@@ -431,7 +431,11 @@ void pojavMakeCurrent(basic_render_window_t* window) {
         NSLog(@"[egl_bridge] pojavMakeCurrent ignored: Vulkan path (CAMetalLayer), no EGL context to make current");
         return;
     }
-    if (!br_make_current) return;
+    if (!br_make_current) {
+        NSLog(@"[egl_bridge] pojavMakeCurrent skipped: br_make_current is NULL");
+        return;
+    }
+    NSLog(@"[egl_bridge] pojavMakeCurrent: window=%p", window);
     br_make_current(window);
 }
 
@@ -463,7 +467,20 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
     // 即使 renderer=libMoltenVK.dylib，pojavInitOpenGL 已设置 GL bridge（set_gl_bridge_tbl），
     // 所以这里会调用 gl_init_context 创建 ANGLE Metal EGL 上下文
     NSLog(@"[egl_bridge] OpenGL path: creating EGL/GL context via br_init_context");
-    return br_init_context(contextSrc);
+    basic_render_window_t* bundle = (basic_render_window_t*)br_init_context(contextSrc);
+    // EGL 的 current context 是线程级的。MobileGlues 的 constructor 在 JVM 启动前于
+    // 启动器线程建了一个 32x32 的 ES 2.0 pbuffer 并 makeCurrent，而 MC 的 Render thread
+    // 上根本没有 current context —— 于是 LWJGL 的 GL.createCapabilities() 探测
+    // GL_MAJOR_VERSION 失败，抛 "There is no OpenGL context current"。
+    // 本函数由 Render thread 调用，因此在此处立即 makeCurrent 即可覆盖那条残留。
+    // SDL3 路径随后调用的 SDL_GL_MakeCurrent 会重复设置一次，幂等无害。
+    if (bundle != NULL) {
+        NSLog(@"[egl_bridge] pojavCreateContext: making bundle=%p current on this thread", bundle);
+        pojavMakeCurrent(bundle);
+    } else {
+        NSLog(@"[egl_bridge] pojavCreateContext: br_init_context returned NULL, skipping makeCurrent");
+    }
+    return bundle;
 }
 
 void pojavSwapInterval(int interval) {
