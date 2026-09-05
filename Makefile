@@ -342,6 +342,15 @@ dep_mg:
 	echo '[Amethyst v$(VERSION)] dep_mg - end'
 
 dep_mobilegl:
+	@{ echo '== MobileGL build diagnostics =='; \
+	  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
+	  echo "  MOBILEGL_SOURCE_DIR = $(MOBILEGL_SOURCE_DIR)"; \
+	  echo "  source exists       = `test -d '$(MOBILEGL_SOURCE_DIR)' && echo yes || echo no`"; \
+	  echo "  cmake               = `cmake --version 2>&1 | head -1`"; \
+	  echo "  moltenvk            = `test -f '$(MOLTENVK_LIBRARY)' && echo yes || echo no` ($(MOLTENVK_LIBRARY))"; \
+	  echo "  glslang dir         = `test -d '$(MOBILEGL_SOURCE_DIR)'/3rdparty/glslang && echo yes || echo no`"; \
+	  echo "  spirv-tools dir     = `test -d '$(MOBILEGL_SOURCE_DIR)'/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools && echo yes || echo no`"; \
+	} 2>&1 | tee $(SOURCEDIR)/mobilegl-build.log
 	@if [ '$(BUILD_MOBILEGL)' != '1' ]; then \
 		if [ -f "$(MOBILEGL_DYLIB)" ] && [ -f "$(MOBILEGL_GLES_DYLIB)" ]; then \
 			echo '[Amethyst v$(VERSION)] dep_mobilegl - using prebuilt dylibs in Natives/resources/Frameworks/'; \
@@ -353,17 +362,9 @@ dep_mobilegl:
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - skipped (source not found: $(MOBILEGL_SOURCE_DIR))'; \
 	else \
 		echo '[Amethyst v$(VERSION)] dep_mobilegl - start'; \
-		rm -f $(SOURCEDIR)/mobilegl-build.log $(SOURCEDIR)/mobilegl-build.status; \
-		{ echo '== MobileGL build diagnostics =='; \
-		  echo "  BUILD_MOBILEGL      = $(BUILD_MOBILEGL)"; \
-		  echo "  MOBILEGL_SOURCE_DIR = $(MOBILEGL_SOURCE_DIR)"; \
-		  echo "  source exists       = `test -d '$(MOBILEGL_SOURCE_DIR)' && echo yes || echo no`"; \
-		  echo "  cmake               = `cmake --version 2>&1 | head -1`"; \
-		  echo "  moltenvk            = `test -f '$(MOLTENVK_LIBRARY)' && echo yes || echo no` ($(MOLTENVK_LIBRARY))"; \
-		  echo "  glslang dir         = `test -d '$(MOBILEGL_SOURCE_DIR)/3rdparty/glslang' && echo yes || echo no`"; \
-		  echo "  spirv-tools dir     = `test -d '$(MOBILEGL_SOURCE_DIR)/3rdparty/DiligentCore/ThirdParty/SPIRV-Tools' && echo yes || echo no`"; \
-		  echo '== build output =='; \
-		} 2>&1 | tee $(SOURCEDIR)/mobilegl-build.log; \
+		rm -f $(SOURCEDIR)/mobilegl-build.status; \
+		{ echo '== build output =='; \
+		} 2>&1 | tee -a $(SOURCEDIR)/mobilegl-build.log; \
 		{ { $(MAKE) -f $(abspath $(lastword $(MAKEFILE_LIST))) dep_mobilegl_build; \
 		    echo $$? > $(SOURCEDIR)/mobilegl-build.status; \
 		  } 2>&1 | tee -a $(SOURCEDIR)/mobilegl-build.log; \
@@ -624,3 +625,4 @@ clean:
 	echo '[Amethyst v$(VERSION)] clean - end'
 
 .PHONY: all clean check native java jre package dsym deploy help
+
