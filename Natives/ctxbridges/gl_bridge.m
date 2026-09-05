@@ -151,6 +151,49 @@ static bool gl_init() {
 /// 非 SDL3 路径（GLFW / MC 26.2 及以下）恒返回 false。
 extern bool amethyst_sdl3_wants_gles_context(void);
 
+
+#pragma mark - EGL surface 像素尺寸（含 0 尺寸兜底）
+
+// FCL 93bba5a 修复的是同一类问题：SDL 模式下原生侧拿到 0x0 尺寸 → 渲染黑屏。
+//
+// 我们这里的对应点：MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，
+// 必须由调用方显式给出像素宽高。原实现取 layer.bounds.size * contentsScale，但
+// SDL3 路径下 GameSurfaceView 曾被执行过 hidden = YES（SDL 嵌入逻辑所为），UIKit
+// 可能因此未完成布局，bounds 仍为 0 —— MAX(1.0, 0) 得到 1x1 的 surface。它既不
+// 报错也不崩溃，只是画面全黑；而 EGLSurface 只在 gl_init_context 里创建一次，
+// 后续恢复可见 / 窗口 resize 都不会重建，所以黑屏无法自愈。
+//
+// 兜底链：bounds*scale → CAMetalLayer.drawableSize → 主屏物理分辨率。
+// 每档都打日志，便于一轮实测确认究竟走了哪一档。
+static CGSize ame_eglSurfacePixelSize(CALayer *layer) {
+    CGFloat scale = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
+    CGFloat w = layer.bounds.size.width * scale;
+    CGFloat h = layer.bounds.size.height * scale;
+    if (w >= 1.0 && h >= 1.0) {
+        NSLog(@"[gl_bridge] EGL surface size: from bounds %.0fx%.0f @%.2fx", w, h, scale);
+        return CGSizeMake(w, h);
+    }
+
+    // 尚未布局：CAMetalLayer 的 drawableSize 由启动器显式配置，不依赖 view 布局。
+    if ([layer isKindOfClass:CAMetalLayer.class]) {
+        CGSize ds = ((CAMetalLayer *)layer).drawableSize;
+        if (ds.width >= 1.0 && ds.height >= 1.0) {
+            NSLog(@"[gl_bridge] EGL surface size: FALLBACK bounds %.0fx%.0f -> "
+                  @"drawableSize %.0fx%.0f", layer.bounds.size.width,
+                  layer.bounds.size.height, ds.width, ds.height);
+            return ds;
+        }
+    }
+
+    // 最后退回主屏物理分辨率（FCL 的做法）。MC 为横屏，故取长边为宽。
+    CGSize native = UIScreen.mainScreen.nativeBounds.size;
+    CGFloat pw = MAX(native.width, native.height);
+    CGFloat ph = MIN(native.width, native.height);
+    NSLog(@"[gl_bridge] EGL surface size: FALLBACK bounds %.0fx%.0f -> screen %.0fx%.0f",
+          layer.bounds.size.width, layer.bounds.size.height, pw, ph);
+    return CGSizeMake(pw, ph);
+}
+
 gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     gl_render_window_t* bundle = calloc(1, sizeof(gl_render_window_t));
 
@@ -280,9 +323,12 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
     // 像素宽高（乘 contentsScale，与 drawableSize 保持一致），否则 surface 会按
     // 1x1 创建，进世界后画面异常。其余渲染器从 layer 自行推断，传 NULL。
+    // 不能直接 MAX(1.0, bounds*scale)：bounds 为 0 时会静默建出 1x1 的 surface，
+    // 表现为画面全黑且不可自愈（surface 只创建一次）。走兜底链取尺寸。
+    CGSize surfacePx = ame_eglSurfacePixelSize(layer);
     const EGLint mobileGLSurfaceAttribs[] = {
-        EGL_WIDTH, (EGLint)MAX(1.0, round(layer.bounds.size.width * layer.contentsScale)),
-        EGL_HEIGHT, (EGLint)MAX(1.0, round(layer.bounds.size.height * layer.contentsScale)),
+        EGL_WIDTH,  (EGLint)MAX(1.0, round(surfacePx.width)),
+        EGL_HEIGHT, (EGLint)MAX(1.0, round(surfacePx.height)),
         EGL_NONE
     };
     bundle->surface = handle.eglCreateWindowSurface(g_EglDisplay, bundle->config,

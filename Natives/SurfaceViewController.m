@@ -2288,7 +2288,25 @@ BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
 
     pojavWindow.hidden = NO;
     [container bringSubviewToFront:pojavWindow];
-    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden and raised above SDL view");
+
+    // 关键：hidden 期间 UIKit 可能跳过了布局，bounds 仍为 0。
+    // gl_bridge 用 layer.bounds * contentsScale 推算 EGLSurface 像素尺寸，
+    // bounds 为 0 会建出 1x1 的 surface（画面全黑且不可自愈，因为 surface
+    // 只创建一次）。这里强制补一次布局，让 gl_bridge 取到真实尺寸。
+    [pojavWindow setNeedsLayout];
+    [pojavWindow layoutIfNeeded];
+    [container setNeedsLayout];
+    [container layoutIfNeeded];
+
+    CGSize bs = pojavWindow.bounds.size;
+    CGFloat scale = pojavWindow.layer.contentsScale;
+    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden and raised above SDL view "
+          @"(bounds=%.0fx%.0f scale=%.2f -> px %.0fx%.0f)",
+          bs.width, bs.height, scale, bs.width * scale, bs.height * scale);
+    if (bs.width < 1.0 || bs.height < 1.0) {
+        NSLog(@"[SurfaceVC] WARNING: GameSurfaceView bounds still zero after layout; "
+              @"gl_bridge will fall back to drawableSize/screen");
+    }
     return YES;
 }
 
