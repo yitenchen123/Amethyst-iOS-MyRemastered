@@ -1181,6 +1181,49 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     NSLog(@"[JavaLauncher] Using LWJGL %@ (mcVersion=%@)", lwjglVersion, mcVersionId);
     PUSH_MARGV_FORMAT(@"-Dpojav.lwjgl.version=%@", lwjglVersion);
 
+    // 符号隔离（26.3 + mobileglues 崩溃）：在 JVM 启动前预载渲染器
+    //
+    // 崩溃现场固定为 libshaderc.dylib +0x155820，
+    // TGlslangToSpvTraverser::visitAggregate —— 渲染器镜像内嵌的 glslang 与 LWJGL
+    // 随后加载的 libshaderc.dylib 合并后共用 AST 内存池，一方释放即导致另一方
+    // 解引用已释放内存（机理详见 egl_bridge.m 中 preload 处的注释）。
+    //
+    // egl_bridge 里那段 RTLD_LOCAL preload 挂在 SDL_GL_LoadLibrary 上，时机太晚：
+    // LWJGL 在 JVM 内 bootstrap 阶段就按 -Dorg.lwjgl.opengl.libname dlopen 了
+    // 渲染器。日志里两条证据 —— "Initializing MobileGlues ..." 出现在 egl_bridge
+    // preload 之前，且 egl_bridge 打出 "already loaded before preload"。镜像一旦
+    // 以 RTLD_GLOBAL 载入，后续再以 RTLD_LOCAL dlopen 同一文件只增加引用计数，
+    // 不会降级其可见性，隔离形同虚设。
+    //
+    // 故提前到此处（JLI_Launch 之前）以 RTLD_LOCAL 载入：LWJGL 此后的 dlopen 会
+    // 命中这份已加载镜像，可见性保持 RTLD_LOCAL，glslang 符号不再进全局空间。
+    //
+    // 仅在 SDL3 路径（lwjglVersion == "341"，即 26.3+）启用；GLFW 路径
+    // （1.21.1 / 26.2 走 333）行为完全不变。
+    if ([lwjglVersion isEqualToString:@"341"]) {
+        const char *preloadName = getenv("AMETHYST_RENDERER");
+        if (preloadName != NULL && strcmp(preloadName, RENDERER_NAME_VULKAN) == 0) {
+            // 与上方 opengl.libname 的取值规则保持一致：Vulkan renderer 下
+            // LWJGL 实际加载的是 MobileGlues。
+            preloadName = RENDERER_NAME_MOBILEGLUES;
+        }
+        if (preloadName != NULL && preloadName[0] != '\0') {
+            const char *forceGlobal = getenv("AMETHYST_RENDERER_RTLD_GLOBAL");
+            if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+            // 与 egl_bridge.m 同一套排除规则：需要向其他镜像暴露符号的渲染器
+            // 保持 RTLD_GLOBAL（ANGLE 是共享 EGL host；Mesa/gallium 内部互解析）。
+            const BOOL needsGlobalSymbols =
+                strcmp(preloadName, RENDERER_NAME_MTL_ANGLE) == 0 ||
+                strncmp(preloadName, "libOSMesa", 9) == 0;
+            if (!needsGlobalSymbols && !(forceGlobal != NULL && forceGlobal[0] == '1')) {
+                NSString *absPath = [NSString stringWithFormat:@"%@/%s", frameworksPath, preloadName];
+                void *handle = dlopen(absPath.UTF8String, RTLD_LOCAL);
+                NSLog(@"[JavaLauncher] preloaded %s with RTLD_LOCAL before JVM start (%s)",
+                      preloadName, handle != NULL ? "ok" : "FAILED");
+            }
+        }
+    }
+
     NSString *lwjglDir = [NSString stringWithFormat:@"%@/lwjgl-%@", librariesPath, lwjglVersion];
     NSLog(@"[JavaLauncher] Using LWJGL jar at %@/lwjgl.jar", lwjglDir);
 
