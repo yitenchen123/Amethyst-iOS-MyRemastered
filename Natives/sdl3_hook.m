@@ -91,6 +91,24 @@ typedef void *(*ame_fn_SDL_GL_GetCurrentContext)(void);
 typedef bool (*ame_fn_SDL_GetWindowSizeInPixels)(void *window, int *w, int *h);
 typedef bool (*ame_fn_SDL_GL_GetDrawableSize)(void *window, int *w, int *h);
 
+// 事件窗口解析回落（见 ame_SDL_GetWindowFromEvent 处的说明）
+typedef void *(*ame_fn_SDL_GetWindowFromEvent)(const void *event);
+typedef void *(*ame_fn_SDL_GetWindowFromID)(uint32_t id);
+
+// 文本输入：必须在主线程调用（见 ame_SDL_StartTextInputWithProperties 处的说明）
+typedef bool (*ame_fn_SDL_StartTextInput)(void *window);
+typedef bool (*ame_fn_SDL_StartTextInputWithProperties)(void *window,
+                                                        unsigned long long props);
+typedef bool (*ame_fn_SDL_StopTextInput)(void *window);
+typedef bool (*ame_fn_SDL_SetTextInputArea)(void *window, const void *rect, int cursor);
+
+// 子系统初始化：SDL hint 必须在 SDL_Init 之前设置才生效（见 ame_SDL_InitSubSystem）
+typedef bool (*ame_fn_SDL_InitSubSystem)(uint32_t flags);
+typedef bool (*ame_fn_SDL_SetHint)(const char *name, const char *value);
+
+// 前向声明：ame_SDL_InitSubSystem 需要它，而其定义在文件后面的"渲染器分类"区
+static bool ame_glBridgeEnabled(void);
+
 static ame_fn_SDL_GL_SetAttribute ame_real_GL_SetAttribute = NULL;
 static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
@@ -112,6 +130,18 @@ static ame_fn_SDL_GL_DestroyContext ame_real_GL_DestroyContext = NULL;
 static ame_fn_SDL_GL_GetCurrentContext ame_real_GL_GetCurrentContext = NULL;
 static ame_fn_SDL_GetWindowSizeInPixels ame_real_GetWindowSizeInPixels = NULL;
 static ame_fn_SDL_GL_GetDrawableSize ame_real_GL_GetDrawableSize = NULL;
+
+static ame_fn_SDL_GetWindowFromEvent ame_real_GetWindowFromEvent = NULL;
+static ame_fn_SDL_GetWindowFromID ame_real_GetWindowFromID = NULL;
+static ame_fn_SDL_StartTextInput ame_real_StartTextInput = NULL;
+static ame_fn_SDL_StartTextInputWithProperties ame_real_StartTextInputWithProperties = NULL;
+static ame_fn_SDL_StopTextInput ame_real_StopTextInput = NULL;
+static ame_fn_SDL_SetTextInputArea ame_real_SetTextInputArea = NULL;
+static ame_fn_SDL_InitSubSystem ame_real_InitSubSystem = NULL;
+static ame_fn_SDL_SetHint ame_real_SetHint = NULL;
+
+// SDL3 的 SDL_Rect：{ float x, float y, float w, float h; }
+typedef struct { float x, y, w, h; } ame_SDLRect;
 
 #pragma mark - EGL 真实函数（首次解析后固定，避免跨 loader 调用）
 
@@ -357,6 +387,148 @@ static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
     }
     if (ame_real_GL_GetDrawableSize != NULL) {
         return ame_real_GL_GetDrawableSize(window, w, h);
+    }
+    return false;
+}
+
+#pragma mark - 事件窗口解析回落（对齐 ZL2）
+
+// SDL 的鼠标焦点（mouse->focus）会被 SDL_UpdateMouseFocus 的坐标越界判定清除：
+// 虚拟鼠标坐标经分辨率缩放后可超过 SDL window 尺寸。这一点对我们尤其致命 ——
+// 我们把 SDL window 尺寸设成了物理像素（2436x1124），而输入桥上报的坐标是
+// 按 points 换算来的，越界概率比 ZL2 更高，表现为鼠标/触摸时灵时不灵。
+//
+// iOS 同样只有一个窗口，故解析失败时回落到上次成功解析出的窗口（ZL2 的
+// sdlLastEventWindow 等价物）。
+static void *ame_sdlLastEventWindow = NULL;
+
+static void *ame_SDL_GetWindowFromEvent(const void *event) {
+    void *window = ame_real_GetWindowFromEvent != NULL
+                       ? ame_real_GetWindowFromEvent(event)
+                       : NULL;
+    if (window != NULL) {
+        ame_sdlLastEventWindow = window;
+        return window;
+    }
+    if (ame_sdlLastEventWindow != NULL) {
+        NSDebugLog(@"[SDLHook] GetWindowFromEvent: NULL -> fallback %p",
+                   ame_sdlLastEventWindow);
+        return ame_sdlLastEventWindow;
+    }
+    return NULL;
+}
+
+static void *ame_SDL_GetWindowFromID(uint32_t id) {
+    void *window = ame_real_GetWindowFromID != NULL
+                       ? ame_real_GetWindowFromID(id)
+                       : NULL;
+    if (window != NULL) {
+        ame_sdlLastEventWindow = window;
+        return window;
+    }
+    if (ame_sdlLastEventWindow != NULL) {
+        NSDebugLog(@"[SDLHook] GetWindowFromID(%u): NULL -> fallback %p",
+                   (unsigned)id, ame_sdlLastEventWindow);
+        return ame_sdlLastEventWindow;
+    }
+    return NULL;
+}
+
+#pragma mark - 文本输入主线程化
+
+// SDL 的 iOS 后端在 SDL_StartTextInputWithProperties 里直接操作 UIKit
+// （-[SDL_uikitviewcontroller setTextFieldProperties:]）。MC 从渲染线程调用它，
+// 于是出现：
+//     "modifying the autolayout engine from a background thread"
+// 异常虽被 SDL 侧 catch，但布局未能完成，软键盘行为不可预期。
+//
+// 修法：这类入口若不在主线程，就 dispatch 到主线程执行。文本输入是低频操作，
+// 用 async 避免阻塞渲染线程（也避免主线程同步等待造成死锁）。
+static bool ame_dispatchTextInputToMain(void (^work)(void)) {
+    if (work == nil) return false;
+    if ([NSThread isMainThread]) {
+        work();
+        return true;
+    }
+    dispatch_async(dispatch_get_main_queue(), work);
+    return true;
+}
+
+static bool ame_SDL_StartTextInput(void *window) {
+    return ame_dispatchTextInputToMain(^{
+        if (ame_real_StartTextInput != NULL) ame_real_StartTextInput(window);
+    });
+}
+
+static bool ame_SDL_StartTextInputWithProperties(void *window,
+                                                 unsigned long long props) {
+    return ame_dispatchTextInputToMain(^{
+        if (ame_real_StartTextInputWithProperties != NULL) {
+            ame_real_StartTextInputWithProperties(window, props);
+        }
+    });
+}
+
+static bool ame_SDL_StopTextInput(void *window) {
+    return ame_dispatchTextInputToMain(^{
+        if (ame_real_StopTextInput != NULL) ame_real_StopTextInput(window);
+    });
+}
+
+static bool ame_SDL_SetTextInputArea(void *window, const void *rect, int cursor) {
+    // rect 由调用方栈上持有，且 block 是异步执行的 —— 不能把局部变量的地址
+    // 传进 block（函数返回后失效）。改堆分配，由 block 在使用后释放。
+    ame_SDLRect *heapRect = NULL;
+    if (rect != NULL) {
+        heapRect = (ame_SDLRect *)malloc(sizeof(ame_SDLRect));
+        if (heapRect != NULL) memcpy(heapRect, rect, sizeof(ame_SDLRect));
+    }
+
+    if ([NSThread isMainThread]) {
+        bool r = ame_real_SetTextInputArea != NULL
+                     ? ame_real_SetTextInputArea(window, heapRect, cursor)
+                     : false;
+        free(heapRect);
+        return r;
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (ame_real_SetTextInputArea != NULL) {
+            ame_real_SetTextInputArea(window, heapRect, cursor);
+        }
+        free(heapRect);
+    });
+    return true;
+}
+
+#pragma mark - SDL hint（对齐 ZL2 的 SDL_InitSubSystem hook）
+
+// hint 必须在 SDL_Init 之前设置才生效，因此挂在 InitSubSystem 上、在调用
+// 原函数之前设置 —— 这与 ZL2 custom_SDL_InitSubSystem_Func 的做法一致。
+//
+//   SDL_RETURN_KEY_HIDES_IME       ZL2 注释：启动器的正常行为，SDL 默认 false
+//   SDL_ENABLE_SCREEN_KEYBOARD=1   MC 按桌面惯例设成 0 以禁用平台软键盘（改用
+//                                  自绘 IME UI），但移动端依赖 SDL 唤起输入法；
+//                                  MC 在 SDL_Init 之前设值，此处覆盖回启用
+//   SDL_OPENGL_FORCE_SRGB_FRAMEBUFFER=0
+//                                  ZL2：MobileGlues 无法传入正确的 EGL 参数来
+//                                  支持这个；对所有走 EGL bridge 的移动转译型
+//                                  渲染器同样适用
+static bool ame_SDL_InitSubSystem(uint32_t flags) {
+    if (ame_real_SetHint == NULL) {
+        ame_real_SetHint = (ame_fn_SDL_SetHint)ame_real_dlsym("SDL_SetHint");
+    }
+    if (ame_real_SetHint != NULL) {
+        ame_real_SetHint("SDL_RETURN_KEY_HIDES_IME", "true");
+        if (ame_glBridgeEnabled()) {
+            ame_real_SetHint("SDL_OPENGL_FORCE_SRGB_FRAMEBUFFER", "0");
+        }
+        ame_real_SetHint("SDL_ENABLE_SCREEN_KEYBOARD", "1");
+        NSDebugLog(@"[SDLHook] SDL hint set (screenKeyboard=1, srgb=%s)",
+                   ame_glBridgeEnabled() ? "off" : "default");
+    }
+    if (ame_real_InitSubSystem != NULL) {
+        return ame_real_InitSubSystem(flags);
     }
     return false;
 }
@@ -650,6 +822,8 @@ static void ame_SDL_DestroyWindow(void *window) {
         ame_primaryWindowRefs = 0;
         ame_primaryWindowW = 0;
         ame_primaryWindowH = 0;
+        // 窗口已销毁，事件解析回落缓存必须一并失效，否则会返回悬垂指针
+        ame_sdlLastEventWindow = NULL;
     }
     if (ame_real_DestroyWindow) ame_real_DestroyWindow(window);
 }
@@ -983,6 +1157,58 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
             NSDebugLog(@"[SDLHook] hooked SDL_GL_GetDrawableSize -> EGL surface size");
             return (void *)ame_SDL_GL_GetDrawableSize;
         }
+    }
+
+    // —— 以下与渲染后端无关，无条件接管 ——
+    // GLFW 老路径不加载 libSDL3，根本不会查询这些符号，因此不受影响。
+    if (strcmp(name, "SDL_GetWindowFromEvent") == 0) {
+        if (ame_real_GetWindowFromEvent == NULL)
+            ame_real_GetWindowFromEvent =
+                (ame_fn_SDL_GetWindowFromEvent)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_GetWindowFromEvent -> last-window fallback");
+        return (void *)ame_SDL_GetWindowFromEvent;
+    }
+    if (strcmp(name, "SDL_GetWindowFromID") == 0) {
+        if (ame_real_GetWindowFromID == NULL)
+            ame_real_GetWindowFromID =
+                (ame_fn_SDL_GetWindowFromID)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_GetWindowFromID -> last-window fallback");
+        return (void *)ame_SDL_GetWindowFromID;
+    }
+    if (strcmp(name, "SDL_StartTextInput") == 0) {
+        if (ame_real_StartTextInput == NULL)
+            ame_real_StartTextInput =
+                (ame_fn_SDL_StartTextInput)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_StartTextInput -> main thread");
+        return (void *)ame_SDL_StartTextInput;
+    }
+    if (strcmp(name, "SDL_StartTextInputWithProperties") == 0) {
+        if (ame_real_StartTextInputWithProperties == NULL)
+            ame_real_StartTextInputWithProperties =
+                (ame_fn_SDL_StartTextInputWithProperties)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_StartTextInputWithProperties -> main thread");
+        return (void *)ame_SDL_StartTextInputWithProperties;
+    }
+    if (strcmp(name, "SDL_StopTextInput") == 0) {
+        if (ame_real_StopTextInput == NULL)
+            ame_real_StopTextInput =
+                (ame_fn_SDL_StopTextInput)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_StopTextInput -> main thread");
+        return (void *)ame_SDL_StopTextInput;
+    }
+    if (strcmp(name, "SDL_SetTextInputArea") == 0) {
+        if (ame_real_SetTextInputArea == NULL)
+            ame_real_SetTextInputArea =
+                (ame_fn_SDL_SetTextInputArea)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_SetTextInputArea -> main thread");
+        return (void *)ame_SDL_SetTextInputArea;
+    }
+    if (strcmp(name, "SDL_InitSubSystem") == 0) {
+        if (ame_real_InitSubSystem == NULL)
+            ame_real_InitSubSystem =
+                (ame_fn_SDL_InitSubSystem)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_InitSubSystem -> launcher hints");
+        return (void *)ame_SDL_InitSubSystem;
     }
 
     return NULL;
