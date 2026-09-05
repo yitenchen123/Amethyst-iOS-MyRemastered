@@ -148,3 +148,27 @@ void destroy_temp_egl_ctx() {
 
   egl_eglTerminate(eglDisplay);
 }
+
+void release_temp_egl_current() {
+  // iOS/macOS 专用：只解除临时上下文的 current 状态，不销毁、不 eglTerminate。
+  //
+  // 为什么不能直接复用 destroy_temp_egl_ctx()：它末尾的 eglTerminate() 会终止
+  // 整个 EGLDisplay，而该 display 是启动器 gl_bridge 与 MobileGlues 共享的
+  // ANGLE display —— terminate 会连带毁掉 MC 的主渲染上下文。
+  //
+  // 为什么又必须解除 current：init_target_egl() 创建的 32x32 ES 2.0 pbuffer
+  // 上下文在 Apple 上从不清理，会一直占据 current 槽位。MC 随后在
+  // GL.createCapabilities() 里执行 glGetIntegerv(GL_MAJOR_VERSION)，命中的是
+  // 这个 ES 2.0 上下文（该枚举在 ES 2.0 下非法）→ GL_INVALID_ENUM → LWJGL
+  // 回退到 glGetString(GL_VERSION)，此时错误状态仍未清除 → 抛出
+  // "There is no OpenGL context current in the current thread"。
+  //
+  // 只解除 current 而不销毁 surface/context：MobileGlues 后续的着色器编译若
+  // 仍需离屏上下文，可自行 makeCurrent 回来，避免悬垂引用已销毁对象。
+  LOAD_EGL(eglMakeCurrent);
+
+  if (eglDisplay == EGL_NO_DISPLAY) return;
+  if (egl_eglMakeCurrent == NULL) return;
+
+  egl_eglMakeCurrent(eglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+}
