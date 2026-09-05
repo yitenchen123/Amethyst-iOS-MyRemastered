@@ -2289,6 +2289,31 @@ BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
     pojavWindow.hidden = NO;
     [container bringSubviewToFront:pojavWindow];
 
+    // SDL 嵌入后宿主 view 的 frame 可能被改写/缩小，使其只占屏幕一角，画面于是
+    // 缩在左下角并伴随大面积黑边。按启动器已算好的 windowWidth/Height 反推 frame：
+    //     windowWidth  = frame.width * screenScale * resolutionScale
+    //     contentsScale = screenScale * resolutionScale
+    //   => frame.width  = windowWidth / contentsScale
+    // 该结果恒等于全屏逻辑尺寸（与分辨率缩放无关），因此无论用户把分辨率设为
+    // 多少，view 都铺满屏幕，缩放只体现在渲染像素数上。
+    CGFloat hostScale = pojavWindow.layer.contentsScale;
+    if (hostScale > 0.0 && windowWidth > 0 && windowHeight > 0) {
+        CGSize want = CGSizeMake((CGFloat)windowWidth / hostScale,
+                                 (CGFloat)windowHeight / hostScale);
+        CGSize cur = pojavWindow.bounds.size;
+        if (fabs(cur.width - want.width) > 1.0 || fabs(cur.height - want.height) > 1.0) {
+            CGRect f = pojavWindow.frame;
+            f.size = want;
+            pojavWindow.frame = f;
+            NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView frame corrected "
+                  @"%.0fx%.0f -> %.0fx%.0f (scale %.2f -> surface %.0fx%.0f, "
+                  @"drawableSize %dx%d)",
+                  cur.width, cur.height, want.width, want.height, hostScale,
+                  want.width * hostScale, want.height * hostScale,
+                  windowWidth, windowHeight);
+        }
+    }
+
     // 关键：hidden 期间 UIKit 可能跳过了布局，bounds 仍为 0。
     // gl_bridge 用 layer.bounds * contentsScale 推算 EGLSurface 像素尺寸，
     // bounds 为 0 会建出 1x1 的 surface（画面全黑且不可自愈，因为 surface
