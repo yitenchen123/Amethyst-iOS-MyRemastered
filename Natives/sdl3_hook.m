@@ -365,18 +365,20 @@ static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
 // 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale，
 // 而 EGL surface 由 SurfaceViewController 的 layer 独立创建，两者对不上 → 黑屏。
 //
-// —— 单位陷阱（曾导致画面缩在左下角）——
-// SDL_SetWindowSize() 收的是 points（屏幕坐标），而 MC 请求的是像素值（启动器
-// 把 physicalSize 传给了它）。早前直接拿请求值调用，75% 分辨率下窗口被设成
-// 1826x844 points，是屏幕逻辑尺寸（812x375）的 2.25 倍；MC 随后按
-// "points x SDL 像素密度(3.0)" 推算 framebuffer，得到远大于实际 EGL surface 的
-// viewport，画面因此只占左下角一角（100% 分辨率时才恰好对上，故看似"能出画面"）。
+// —— 窗口尺寸必须用像素，而不是 points（对齐 ZL2 / 安卓与 GLFW）——
+// ZL2 的 SDLSurface.nativeResize() 调用
+//     SDLActivity.nativeSetScreenResolution(surfaceW, surfaceH,
+//                                           deviceW, deviceH, density, rate)
+// 把"窗口尺寸"直接定义成 Surface 的像素尺寸，而非 points；GLFW 路径下
+// glfwGetWindowSize() 同样返回物理像素。两者因此都不会把逻辑尺寸误当成渲染尺寸。
 //
-// —— 正确做法：对齐 GLFW 路径 ——
-//   窗口 points   = 全屏逻辑尺寸（恒定，与分辨率无关）
-//   像素密度      = 原生 scale x resolutionScale（由启动器配在 layer 上）
-//   于是 drawable = points x 密度 = physicalSize x 缩放 = EGL surface 尺寸
-// 改分辨率时 points 不变、只有 drawable 变，GUI 布局保持稳定，可随意调整。
+// 早前这里按 SDL 的 points 语义设成全屏逻辑尺寸(812x375)，SDL 随即派发
+// RESIZED(812x375)，MC 便据此设置 viewport —— 而 EGL surface 是 2436x1124，
+// 画面于是只占屏幕一角（约 1/9 面积）。现改为全屏物理像素，与 ZL2/安卓、GLFW
+// 语义一致：窗口尺寸恒定 → GUI 布局稳定；渲染像素随分辨率变 → 可自由缩放。
+//
+// 注意取原生 scale 而非 layer.contentsScale：后者含 resolutionScale，若乘上去
+// 会让窗口尺寸随分辨率变化，GUI 布局跟着变（正是要避免的）。
 static void ame_syncReusedWindowSize(void *window, int w, int h) {
     if (window == NULL || w <= 0 || h <= 0) return;
 
@@ -388,30 +390,13 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
         if ([obj isKindOfClass:[UIView class]]) gsv = (UIView *)obj;
     }
 
+    // 窗口尺寸 = 全屏物理像素（恒定，不随 resolutionScale 变化）
     int targetW = w, targetH = h;
-    CGFloat desiredScale = 0.0;
     if (gsv != nil && gsv.bounds.size.width > 0.0 && gsv.bounds.size.height > 0.0) {
-        targetW = (int)round(gsv.bounds.size.width);
-        targetH = (int)round(gsv.bounds.size.height);
-        desiredScale = gsv.layer.contentsScale;   // 已含 resolutionScale
-    }
-    if (desiredScale <= 0.0) {
-        // 兜底：由请求像素尺寸与全屏 points 反推缩放比
-        CGSize sp = [UIScreen mainScreen].bounds.size;
-        CGFloat sx = (double)w / MAX(1.0, (double)sp.width);
-        CGFloat sy = (double)h / MAX(1.0, (double)sp.height);
-        CGFloat inferred = MIN(sx, sy);
-        if (inferred > 0.1) desiredScale = inferred;
-    }
-
-    // 同步 SDL 视图的像素密度，使 "points x density" 等于 EGL surface 尺寸
-    UIView *sdlView = ame_findSDLView(gsv);
-    if (sdlView != nil && desiredScale > 0.0 &&
-        fabs((double)sdlView.contentScaleFactor - (double)desiredScale) > 0.001) {
-        CGFloat old = sdlView.contentScaleFactor;
-        sdlView.contentScaleFactor = desiredScale;
-        NSDebugLog(@"[SDLHook] SDL view contentScaleFactor %.3f -> %.3f",
-                   old, desiredScale);
+        CGFloat native = [UIScreen mainScreen].scale;
+        if (!(native > 0.0)) native = 1.0;
+        targetW = (int)round(gsv.bounds.size.width  * native);
+        targetH = (int)round(gsv.bounds.size.height * native);
     }
 
     if (ame_real_SetWindowSize == NULL) {
@@ -422,13 +407,39 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
     if (ame_real_SetWindowSize != NULL) {
         ok = ame_real_SetWindowSize(window, targetW, targetH);
     }
-    NSDebugLog(@"[SDLHook] reused window resize %dx%d -> %dx%d pts @%.3fx "
-               @"(drawable %.0fx%.0f, req px %dx%d) (%s)",
-               ame_primaryWindowW, ame_primaryWindowH, targetW, targetH,
-               desiredScale,
-               (double)targetW * desiredScale, (double)targetH * desiredScale,
-               w, h,
-               ok ? "ok" : (ame_real_SetWindowSize ? "rejected" : "no SDL_SetWindowSize"));
+
+    // SetWindowSize 之后 SDL 会按自身换算调整视图；这里把视图强制回全屏逻辑尺寸
+    // 并把密度归一，使显示仍铺满屏幕（真正的渲染尺寸由 EGL surface 决定）。
+    UIView *sdlView = ame_findSDLView(gsv);
+    if (sdlView != nil) {
+        if (fabs((double)sdlView.contentScaleFactor - 1.0) > 0.001) {
+            CGFloat old = sdlView.contentScaleFactor;
+            sdlView.contentScaleFactor = 1.0;
+            NSDebugLog(@"[SDLHook] SDL view contentScaleFactor %.3f -> 1.000 "
+                       @"(window sized in pixels)", old);
+        }
+        if (gsv != nil && gsv.bounds.size.width > 0.0) {
+            CGRect full = CGRectMake(0.0, 0.0,
+                                     gsv.bounds.size.width,
+                                     gsv.bounds.size.height);
+            CGSize cur = sdlView.frame.size;
+            if (fabs((double)cur.width  - (double)full.size.width)  > 0.5 ||
+                fabs((double)cur.height - (double)full.size.height) > 0.5) {
+                NSDebugLog(@"[SDLHook] SDL view frame %.0fx%.0f -> %.0fx%.0f "
+                           @"(fullscreen points)",
+                           cur.width, cur.height,
+                           full.size.width, full.size.height);
+                sdlView.frame = full;
+                [sdlView setNeedsLayout];
+            }
+        }
+    }
+
+    NSDebugLog(@"[SDLHook] reused window resize %dx%d -> %dx%d px "
+               @"(req px %dx%d) (%s)",
+               ame_primaryWindowW, ame_primaryWindowH, targetW, targetH, w, h,
+               ok ? "ok" : (ame_real_SetWindowSize ? "rejected"
+                                                   : "no SDL_SetWindowSize"));
     ame_primaryWindowW = targetW;
     ame_primaryWindowH = targetH;
 }
