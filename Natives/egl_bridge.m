@@ -79,8 +79,46 @@ bool pojavIsActualVulkanPath() {
     return false;
 }
 
+/// 把 "libXxx.dylib" 形式的磁盘文件名转成 LWJGL 期望的"裸名"（"Xxx"）。
+///
+/// 与 JavaLauncher.m 的 lwjglBareLibName() 规则一致，但这里必须单独再剥一层：
+/// JNI_LWJGL_changeRenderer 是在**运行时**用 System.setProperty 写
+/// org.lwjgl.opengl.libname 的，会覆盖 JavaLauncher.m 通过 -D 传进去的裸名。
+/// 若此处传完整文件名，LWJGL 的
+///     Pattern DYLIB = Pattern.compile("(?:^|/)lib\\w+(?:[.]\\d+)*[.]dylib$")
+/// 因为 \\w 不含连字符，对 "libMobileGL-gles.dylib" 会判定为"不是 dylib 文件名"，
+/// 转交 System.mapLibraryName 再补一层前缀后缀 ->
+///     "liblibMobileGL-gles.dylib.dylib"
+/// 磁盘上没有这个文件，于是 GL.create() 抛
+///     UnsatisfiedLinkError: Failed to locate library: liblibMobileGL-gles.dylib.dylib
+/// 名字里没有连字符的库（mobileglues / gl4es_114 / tinygl4angle / MobileGL /
+/// OSMesa.8）恰好都能匹配该正则，所以长期只有 GLES 这一个库受影响。
+///
+/// 在入口统一剥壳，四个调用点（pojavInitOpenGLInternal 的统一分支与
+/// mobileglues 分支、pojavSetWindowHint 的 gl4es / mobileglues 分支）一并受保护。
+static NSString *lwjglBareLibNameForProperty(const char *fileName) {
+    if (fileName == NULL) return nil;
+    NSString *name = [NSString stringWithUTF8String:fileName];
+    // "lib".length == 3，".dylib".length == 6，合计 9。
+    if (name.length > 9 && [name hasPrefix:@"lib"] && [name hasSuffix:@".dylib"]) {
+        return [name substringWithRange:NSMakeRange(3, name.length - 9)];
+    }
+    // 不是标准命名（例如别名或已带路径）就原样返回，保持原有行为。
+    return name;
+}
+
 void JNI_LWJGL_changeRenderer(const char* value_c) {
     if (value_c == NULL) return;
+
+    // 必须传裸名，不能传完整文件名：完整名会被 LWJGL 二次包装成
+    // "liblibXxx.dylib.dylib"（详见 lwjglBareLibNameForProperty 的注释）。
+    NSString *bareName = lwjglBareLibNameForProperty(value_c);
+    const char *bare_c = bareName == nil ? NULL : bareName.UTF8String;
+    if (bare_c == NULL) return;
+    if (strcmp(bare_c, value_c) != 0) {
+        NSLog(@"[egl_bridge] opengl.libname: '%s' -> bare name '%s' (avoid LWJGL double-wrap)",
+              value_c, bare_c);
+    }
 
     // 原实现直接 (*runtimeJavaVMPtr)->GetEnv(...) 且不检查返回值。
     // 在非 JVM 线程上（SDL 的视频/事件线程，SDL3 路径的 SDL_GL_LoadLibrary 就发生在
@@ -89,7 +127,7 @@ void JNI_LWJGL_changeRenderer(const char* value_c) {
     // 这里补齐：VM 判空 -> GetEnv 结果判空 -> AttachCurrentThread 兜底 -> 用完 detach。
     JavaVM *vm = runtimeJavaVMPtr;
     if (vm == NULL) {
-        NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: runtimeJavaVMPtr is NULL", value_c);
+        NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: runtimeJavaVMPtr is NULL", bare_c);
         return;
     }
 
@@ -97,14 +135,14 @@ void JNI_LWJGL_changeRenderer(const char* value_c) {
     BOOL attached = NO;
     if ((*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_4) != JNI_OK || env == NULL) {
         if ((*vm)->AttachCurrentThread(vm, (void **)&env, NULL) != JNI_OK || env == NULL) {
-            NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: cannot obtain JNIEnv", value_c);
+            NSLog(@"[egl_bridge] JNI_LWJGL_changeRenderer('%s') skipped: cannot obtain JNIEnv", bare_c);
             return;
         }
         attached = YES;
     }
 
     jstring key = (*env)->NewStringUTF(env, "org.lwjgl.opengl.libname");
-    jstring value = (*env)->NewStringUTF(env, value_c);
+    jstring value = (*env)->NewStringUTF(env, bare_c);
     if (key != NULL && value != NULL) {
         jclass clazz = (*env)->FindClass(env, "java/lang/System");
         if (clazz != NULL) {
@@ -241,7 +279,7 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         //   - prefer_opengl：MC 走 GL 路径，glfwWindowHint(GLFW_OPENGL_API) → EGL 上下文
         //   - default：MC 内部决定，两种路径都能处理
         //
-        // 注意：JavaLauncher.m 已在 Vulkan 模式下设置 org.lwjgl.opengl.libname=libmobileglues.dylib，
+        // 注意：JavaLauncher.m 已在 Vulkan 模式下设置 org.lwjgl.opengl.libname=mobileglues（裸名），
         // 所以 LWJGL 加载的 GL 库是 MobileGlues（GL→Vulkan 翻译层），能通过 Vulkan 后端路由 GL 调用。
         // 这就是用户说的"用 OpenGL 渲染游戏加用 MoltenVK，帧率才能达到 120"的实现原理：
         // MC 走 GL 路径 → EGL 上下文（ANGLE Metal）→ MobileGlues 翻译 → Vulkan → MoltenVK → Metal
@@ -252,7 +290,7 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         dlopen("@rpath/" RENDERER_NAME_VULKAN, RTLD_GLOBAL);
         // Vulkan 模式下 LWJGL OpenGL 库使用 MobileGlues（由 JavaLauncher.m 设置）
         // 不再调用 JNI_LWJGL_changeRenderer(RENDERER_NAME_MTL_ANGLE)，
-        // 因为 JavaLauncher.m 已通过 -Dorg.lwjgl.opengl.libname=libmobileglues.dylib 设置
+        // 因为 JavaLauncher.m 已通过 -Dorg.lwjgl.opengl.libname=mobileglues（裸名）设置
         if (setLwjglProperty) JNI_LWJGL_changeRenderer(RENDERER_NAME_MOBILEGLUES);
         // 跳过下方的统一 JNI_LWJGL_changeRenderer 和 dlopen（已处理）
         return pojavFinishOpenGLInit(!br_init());
