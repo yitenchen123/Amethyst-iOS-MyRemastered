@@ -111,7 +111,8 @@ jobs:
           set -o pipefail
           export PATH=/opt/homebrew/bin:$PATH
           export SLIMMED=0
-          export BUILD_MOBILEGL="${BUILD_MOBILEGL:-0}"
+          export BUILD_MOBILEGL="${BUILD_MOBILEGL:-1}"
+          echo "[ci] BUILD_MOBILEGL=${BUILD_MOBILEGL} vars=${{ vars.BUILD_MOBILEGL }} src=$(test -d Natives/external/MobileGL && echo yes || echo no)"
 
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
