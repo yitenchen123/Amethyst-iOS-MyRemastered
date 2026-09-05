@@ -536,14 +536,29 @@ static void ame_SDL_UnloadObject(void *handle) {
 // vulkan_zink）与原生 Vulkan（libMoltenVK），因此 zink 在 26.3 上"回落 Vulkan"
 // 那条已验证可用的路径不会受到任何影响。
 //
-// 默认关闭（实测结论）：接管后 MC 走 OpenGL 后端，会要求渲染器以桌面 GL 提供
-// 上下文（MobileGL 对外声明 4.6），由此生成的桌面 GLSL 经 shaderc/glslang 编译
-// 时稳定崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致）。
-// 不接管时 MC 回落 Vulkan（MoltenVK）可正常加载资源并进入世界。
-// 因此在修复 glslang 桌面 GLSL 路径之前默认不接管；需要继续试验时可用
-// AMETHYST_SDL_GL_BRIDGE=1 打开。
+// 默认开启（2026-09-05 实测结论）：
+//
+// 此前默认关闭的理由是"接管后桌面 GLSL 经 shaderc/glslang 编译稳定崩溃"。该
+// 崩溃根因已定位并修复 —— MobileGL 静态嵌入 glslang/SPIRV-Tools，其 C++ 符号
+// 与 shaderc 内嵌的副本在 dyld 层 interpose，同一 Module 对象被两套布局解析，
+// 崩于 spvtools::opt::Module::ForEachInst。上游 MobileGL 早已为 macOS 用
+// exported_symbols_list 修过（只导出 _CGL*/_egl*/_gl[A-Z0-9]*），唯独 iOS 分支
+// 被条件排除；补齐后重编的 dylib 实测不再崩溃。
+//
+// 另需说明：崩溃与"是否接管"无关。曾实测 BRIDGE=0 + NO_PRELOAD_RENDERER=1 同样
+// 崩在同一地址 —— 真正的变量是 MobileGL 以 RTLD_GLOBAL 还是 RTLD_LOCAL 载入。
+//
+// 实测（874b9e8，接管 + DirectGLES）：MC 完整走通 OpenGL 后端，资源全部加载、
+// 首帧渲染成功、无崩溃，仅画面全黑。黑屏系主窗口复用后未同步尺寸所致，已由
+// ame_syncReusedWindowSize() 修复（iOS 无 ZL2 依赖的 Android Surface 前提）。
+//
+// 回落路径的风险已不再是默认关闭的理由：MoltenVK 1.2.9（为修 A11 上 1.21.1
+// 草方块而降级）转译不了 MC 26.3 的 SPIR-V，会生成非法 MSL
+// （float3 vertex(thread const int& index)），故 26.3 现在更不能依赖回落。
+//
+// 如需回到"不接管 -> 回落 Vulkan"，用 AMETHYST_SDL_GL_BRIDGE=0。
 static bool ame_glBridgeEnabled(void) {
-    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", false)) return false;
+    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", true)) return false;
 
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return false;
