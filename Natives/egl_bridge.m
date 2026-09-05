@@ -3,6 +3,7 @@
 #include "jni.h"
 #include <assert.h>
 #include <dlfcn.h>
+#include <string.h>
 
 #include <pthread.h>
 #include <stdint.h>
@@ -305,22 +306,60 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
     }
     // Preload renderer library
     //
-    // MobileGL 用 RTLD_LOCAL，其余渲染器保持 RTLD_GLOBAL（GLFW 路径的历史行为）。
-    // 完整理由见 gl_bridge.m 的 dlsym_EGL()：要点是阻止 libMobileGL.dylib 内置的
-    // glslang 弱符号进入全局符号空间，避免与 libshaderc.dylib 那份合并后共用 AST
-    // 内存池（合并会导致 visitAggregate 访问已回收节点而 SIGSEGV）。
+    // 符号隔离（仅 SDL3 路径）：
+    // 部分渲染器镜像内静态链接了一份 glslang。以 RTLD_GLOBAL 载入时，其中大量
+    // N_WEAK_DEF 符号会被提升进全局符号空间；随后 LWJGL 加载 libshaderc.dylib
+    // 时，dyld 把 shaderc 那份 glslang 合并到渲染器这份上，二者共用线程局部的
+    // AST 内存池 —— 渲染器销毁自己的 TShader 时会连带回收 shaderc 仍在使用的
+    // AST 节点，TGlslangToSpvTraverser::visitAggregate 随即解引用到已释放内存
+    // （SIGSEGV；26.3 上崩溃地址固定在 +0x155820）。
+    //
+    // 最初只对 MobileGL 启用，但 MobileGlues 同样内嵌 glslang（26.3 + mobileglues
+    // 崩在同一个 visitAggregate），白名单式判断漏掉了它。故改为按种类判断。
+    //
+    // 判定模型参照 ZL2 sdlGlesCompatEnabled()：默认启用 + 显式排除，
+    // 而不是"只对已知的这一个渲染器启用"。
+    //
+    // 显式排除（必须保持 RTLD_GLOBAL）：
+    //   - ANGLE：多个渲染器共享的 EGL host。LTW 的 constructor 靠全局 dlsym 找
+    //     eglGetProcAddress，降级为 RTLD_LOCAL 会让 LTW 初始化失败。
+    //   - OSMesa 系（gallium/zink，对应 ZL2 的 gallium_* / custom_gallium）：
+    //     Mesa 内部组件之间靠全局符号互相解析。
+    //
+    // GLFW 路径（setLwjglProperty == YES，1.21.1 / 26.2 等）行为完全不变。
+    // 逃生开关：AMETHYST_RENDERER_RTLD_GLOBAL=1 恢复旧行为，无需重新构建
+    // （旧名 AMETHYST_MOBILEGL_RTLD_GLOBAL 仍兼容）。
     {
-        const char *forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
-        bool useLocal = isMobileGLRenderer(renderer.UTF8String) &&
+        const char *forceGlobal = getenv("AMETHYST_RENDERER_RTLD_GLOBAL");
+        if (forceGlobal == NULL) forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
+        const BOOL isSDL3Path = (setLwjglProperty == NO);
+        const char *r = renderer.UTF8String;
+        // 需要向其他镜像暴露符号的渲染器，保持 RTLD_GLOBAL
+        const BOOL needsGlobalSymbols =
+            strcmp(r, RENDERER_NAME_MTL_ANGLE) == 0 ||   // 共享 EGL host（LTW 依赖）
+            strncmp(r, "libOSMesa", 9) == 0;             // Mesa / gallium 内部互解析
+        bool useLocal = isSDL3Path && !needsGlobalSymbols &&
                         !(forceGlobal && forceGlobal[0] == '1');
         int dlFlags = useLocal ? RTLD_LOCAL : RTLD_GLOBAL;
-        NSDebugLog(@"[egl_bridge] preloading %@ with %s", renderer,
-                   useLocal ? "RTLD_LOCAL" : "RTLD_GLOBAL");
-        if (useLocal) {
-            NSLog(@"[egl_bridge] MobileGL loaded with RTLD_LOCAL "
-                  @"(glslang symbols isolated from libshaderc.dylib)");
+        NSString *rpath = [NSString stringWithFormat:@"@rpath/%@", renderer];
+
+        // RTLD_NOLOAD 探测：若 LWJGL 已先于此处加载过该库（26.3 上常见，它经
+        // -Dorg.lwjgl.opengl.libname 在 bootstrap 阶段就 dlopen 了），本次
+        // dlopen 的 RTLD_LOCAL 不会再改变其可见性，隔离将不生效。这种情况单独
+        // 打日志，避免"看着改了其实没生效"。
+        void *pre = dlopen(rpath.UTF8String, RTLD_NOLOAD);
+        if (pre != NULL) {
+            NSDebugLog(@"[egl_bridge] %@ already loaded before preload "
+                       @"(LWJGL loaded it first; RTLD_LOCAL isolation will not apply)", renderer);
         }
-        dlopen([NSString stringWithFormat:@"@rpath/%@", renderer].UTF8String, dlFlags);
+
+        NSDebugLog(@"[egl_bridge] preloading %@ with %s (sdl3Path=%d)",
+                   renderer, useLocal ? "RTLD_LOCAL" : "RTLD_GLOBAL", isSDL3Path);
+        if (useLocal) {
+            NSLog(@"[egl_bridge] %@ loaded with RTLD_LOCAL "
+                  @"(glslang symbols isolated from libshaderc.dylib)", renderer);
+        }
+        dlopen(rpath.UTF8String, dlFlags);
     }
 
     return pojavFinishOpenGLInit(!br_init());
