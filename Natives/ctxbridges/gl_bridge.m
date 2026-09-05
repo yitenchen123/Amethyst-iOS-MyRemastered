@@ -166,23 +166,37 @@ extern bool amethyst_sdl3_wants_gles_context(void);
 // 兜底链：bounds*scale → CAMetalLayer.drawableSize → 主屏物理分辨率。
 // 每档都打日志，便于一轮实测确认究竟走了哪一档。
 static CGSize ame_eglSurfacePixelSize(CALayer *layer) {
+    // 优先采用 CAMetalLayer.drawableSize：它由启动器显式配置为
+    // physicalSize * resolutionScale，是精确的渲染分辨率，且与该 layer 的
+    // 呈现缓冲严格一致。
+    //
+    // 不能反过来先算 bounds * contentsScale：SDL3 嵌入后宿主 view 的 frame
+    // 可能被改写（缩小），此时 bounds*scale 会得到一个合法的、但明显偏小的
+    // 值（例如 913x421）——既不会触发任何兜底，又让 EGLSurface 只覆盖 layer
+    // 的一角，表现为画面缩在左下角、四周大面积黑边。drawableSize 不受 view
+    // 布局影响，是唯一可靠的基准；用户调分辨率时它也同步变化，因此缩放依旧
+    // 生效（体现在渲染像素数上，而非显示区域大小）。
+    if ([layer isKindOfClass:CAMetalLayer.class]) {
+        CGSize ds = ((CAMetalLayer *)layer).drawableSize;
+        if (ds.width >= 1.0 && ds.height >= 1.0) {
+            NSLog(@"[gl_bridge] EGL surface size: from drawableSize %.0fx%.0f "
+                  @"(bounds %.0fx%.0f @%.2fx would give %.0fx%.0f)",
+                  ds.width, ds.height,
+                  layer.bounds.size.width, layer.bounds.size.height,
+                  layer.contentsScale,
+                  layer.bounds.size.width * layer.contentsScale,
+                  layer.bounds.size.height * layer.contentsScale);
+            return ds;
+        }
+    }
+
+    // 非 CAMetalLayer（或 drawableSize 尚未配置）：退回 bounds * contentsScale。
     CGFloat scale = layer.contentsScale > 0.0 ? layer.contentsScale : 1.0;
     CGFloat w = layer.bounds.size.width * scale;
     CGFloat h = layer.bounds.size.height * scale;
     if (w >= 1.0 && h >= 1.0) {
         NSLog(@"[gl_bridge] EGL surface size: from bounds %.0fx%.0f @%.2fx", w, h, scale);
         return CGSizeMake(w, h);
-    }
-
-    // 尚未布局：CAMetalLayer 的 drawableSize 由启动器显式配置，不依赖 view 布局。
-    if ([layer isKindOfClass:CAMetalLayer.class]) {
-        CGSize ds = ((CAMetalLayer *)layer).drawableSize;
-        if (ds.width >= 1.0 && ds.height >= 1.0) {
-            NSLog(@"[gl_bridge] EGL surface size: FALLBACK bounds %.0fx%.0f -> "
-                  @"drawableSize %.0fx%.0f", layer.bounds.size.width,
-                  layer.bounds.size.height, ds.width, ds.height);
-            return ds;
-        }
     }
 
     // 最后退回主屏物理分辨率（FCL 的做法）。MC 为横屏，故取长边为宽。
