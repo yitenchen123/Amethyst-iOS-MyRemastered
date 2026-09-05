@@ -87,6 +87,10 @@ typedef bool (*ame_fn_SDL_GL_SetSwapInterval)(int interval);
 typedef bool (*ame_fn_SDL_GL_DestroyContext)(void *context);
 typedef void *(*ame_fn_SDL_GL_GetCurrentContext)(void);
 
+// 尺寸查询（见 ame_SDL_GetWindowSizeInPixels 处的说明）
+typedef bool (*ame_fn_SDL_GetWindowSizeInPixels)(void *window, int *w, int *h);
+typedef bool (*ame_fn_SDL_GL_GetDrawableSize)(void *window, int *w, int *h);
+
 static ame_fn_SDL_GL_SetAttribute ame_real_GL_SetAttribute = NULL;
 static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
@@ -106,6 +110,8 @@ static ame_fn_SDL_GL_GetProcAddress ame_real_GL_GetProcAddress = NULL;
 static ame_fn_SDL_GL_SetSwapInterval ame_real_GL_SetSwapInterval = NULL;
 static ame_fn_SDL_GL_DestroyContext ame_real_GL_DestroyContext = NULL;
 static ame_fn_SDL_GL_GetCurrentContext ame_real_GL_GetCurrentContext = NULL;
+static ame_fn_SDL_GetWindowSizeInPixels ame_real_GetWindowSizeInPixels = NULL;
+static ame_fn_SDL_GL_GetDrawableSize ame_real_GL_GetDrawableSize = NULL;
 
 #pragma mark - EGL 真实函数（首次解析后固定，避免跨 loader 调用）
 
@@ -272,6 +278,89 @@ static UIView *ame_findSDLView(UIView *from) {
 // iOS 专有：ZL2 明确注释了"尺寸无需额外处理，由 Android Surface 决定（创建时即
 // 取 Surface 尺寸，与请求值无关）"。iOS 没有这个前提 —— SDL 的 UIKit 后端按
 // 请求值建窗口，于是 RenderPearl 那个隐藏工具窗口就是实打实的 320x480。
+#pragma mark - EGL surface 真实像素尺寸
+
+// 取 EGL surface 的真实像素尺寸 —— 即 CAMetalLayer.drawableSize，由启动器配成
+// physicalSize x resolutionScale。这是 ANGLE 实际渲染的分辨率。
+static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
+    if (outW == NULL || outH == NULL) return false;
+
+    UIView *gsv = nil;
+    Class svc = NSClassFromString(@"SurfaceViewController");
+    if (svc != nil && [svc respondsToSelector:NSSelectorFromString(@"surface")]) {
+        id obj = [svc performSelector:NSSelectorFromString(@"surface")];
+        if ([obj isKindOfClass:[UIView class]]) gsv = (UIView *)obj;
+    }
+    if (gsv == nil) return false;
+    CALayer *layer = gsv.layer;
+    if (layer == nil) return false;
+
+    // 优先取 CAMetalLayer.drawableSize（gl_bridge 建 surface 用的就是它）
+    SEL sel = NSSelectorFromString(@"drawableSize");
+    if ([layer respondsToSelector:sel]) {
+        NSMethodSignature *sig = [layer methodSignatureForSelector:sel];
+        if (sig != nil && strcmp([sig methodReturnType], @encode(CGSize)) == 0) {
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.selector = sel;
+            [inv invokeWithTarget:layer];
+            CGSize size = CGSizeZero;
+            [inv getReturnValue:&size];
+            if (size.width > 1.0 && size.height > 1.0) {
+                *outW = (int)round(size.width);
+                *outH = (int)round(size.height);
+                return true;
+            }
+        }
+    }
+    // 回退：bounds x contentsScale（启动器配置两者一致，最多差 1 像素的取整）
+    CGFloat scale = layer.contentsScale;
+    CGSize bs = layer.bounds.size;
+    if (scale > 0.0 && bs.width > 1.0 && bs.height > 1.0) {
+        *outW = (int)round(bs.width * scale);
+        *outH = (int)round(bs.height * scale);
+        return true;
+    }
+    return false;
+}
+
+// —— 为什么要接管这两个查询 ——
+// MC 的 viewport / framebuffer 尺寸来自它们。SDL 内部把「像素密度」固定为
+// UIScreen.scale（本设备 3.0），完全不知道启动器的 resolutionScale，
+// 于是无论用户设 25% 还是 100%，SDL 一律回报
+// points(812x375) x 3.0 = 2436x1125。而 EGL surface 是
+// physicalSize x resolutionScale，两者只在 100% 时相等：
+//   100% -> 2436 vs 2436  正常
+//    75% -> 2436 vs 1826  viewport 大 1.33 倍，画面被裁到左下角
+//    25% -> 2436 vs  609  viewport 大 4 倍，画面严重超出屏幕
+// 接管后回报 EGL surface 的真实尺寸，viewport 与 surface 严格一致；
+// 而 points 仍恒为全屏逻辑尺寸（供输入坐标与 GUI 布局），两者解耦，
+// 行为与 GLFW 路径一致：改分辨率只改渲染像素，画面布局不变。
+static bool ame_SDL_GetWindowSizeInPixels(void *window, int *w, int *h) {
+    int sw = 0, sh = 0;
+    if (ame_eglSurfacePixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
+    if (ame_real_GetWindowSizeInPixels != NULL) {
+        return ame_real_GetWindowSizeInPixels(window, w, h);
+    }
+    return false;
+}
+
+static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
+    int sw = 0, sh = 0;
+    if (ame_eglSurfacePixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
+    if (ame_real_GL_GetDrawableSize != NULL) {
+        return ame_real_GL_GetDrawableSize(window, w, h);
+    }
+    return false;
+}
+
 //
 // 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale，
 // 而 EGL surface 由 SurfaceViewController 的 layer 独立创建，两者对不上 → 黑屏。
@@ -818,6 +907,15 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         }
         return (void *)ame_SDL_UnloadObject;
     }
+    // 尺寸查询：与 GL 后端无关，无条件接管（见函数处注释）
+    if (strcmp(name, "SDL_GetWindowSizeInPixels") == 0) {
+        if (ame_real_GetWindowSizeInPixels == NULL) {
+            ame_real_GetWindowSizeInPixels =
+                (ame_fn_SDL_GetWindowSizeInPixels)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_GetWindowSizeInPixels -> EGL surface size");
+        return (void *)ame_SDL_GetWindowSizeInPixels;
+    }
     // SDL_GL_SetAttribute 不接管：MC 自己调用它设属性是合法行为，我们只在
     // 建窗前主动调用同一个函数来强制 ES profile（见 ame_forceEglProfileEs）。
     // SDL GL 上下文接管（MobileGL / Mithril / MobileGlues / gl4es / LTW）
@@ -867,6 +965,12 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
             if (ame_real_GL_GetCurrentContext == NULL)
                 ame_real_GL_GetCurrentContext = (ame_fn_SDL_GL_GetCurrentContext)amethyst_orig_dlsym(handle, name);
             return (void *)ame_SDL_GL_GetCurrentContext;
+        }
+        if (strcmp(name, "SDL_GL_GetDrawableSize") == 0) {
+            if (ame_real_GL_GetDrawableSize == NULL)
+                ame_real_GL_GetDrawableSize = (ame_fn_SDL_GL_GetDrawableSize)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GL_GetDrawableSize -> EGL surface size");
+            return (void *)ame_SDL_GL_GetDrawableSize;
         }
     }
 
