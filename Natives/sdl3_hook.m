@@ -524,6 +524,14 @@ typedef union ame_SDL_Event {
 typedef bool (*ame_fn_SDL_PushEvent)(void *event);
 typedef uint32_t (*ame_fn_SDL_GetWindowID)(void *window);
 
+// SDL_SendWindowEvent 属 SDL 内部函数（SDL_internal.h），不在公开 dynapi 表里，
+// 但是否导出取决于构建配置，故运行时探测。它比 SDL_PushEvent 多做的那一步
+// 正是我们缺的：函数内部会执行 `window->w = data1; window->h = data2;`，
+// 并连锁触发 SDL_OnWindowResized / SDL_CheckWindowPixelSizeChanged，
+// 使 SDL 内部状态与派发出去的事件保持一致。PushEvent 只入队，不修正状态。
+typedef bool (*ame_fn_SDL_SendWindowEvent)(void *window, uint32_t event,
+                                           int32_t data1, int32_t data2);
+
 static ame_fn_SDL_PushEvent ame_real_PushEvent = NULL;
 static ame_fn_SDL_GetWindowID ame_real_GetWindowID = NULL;
 
@@ -544,11 +552,33 @@ static bool ame_pushWindowResized(void *window) {
     int pw = 0, ph = 0;
     if (!ame_eglSurfacePixelSize(&pw, &ph)) return false;
 
+    uint32_t wid = (ame_real_GetWindowID != NULL)
+                       ? ame_real_GetWindowID(window) : 0u;
+
+    static int ame_sendWindowEventProbed = 0;
+    static ame_fn_SDL_SendWindowEvent ame_real_SendWindowEvent = NULL;
+    if (!ame_sendWindowEventProbed) {
+        ame_sendWindowEventProbed = 1;
+        ame_real_SendWindowEvent =
+            (ame_fn_SDL_SendWindowEvent)ame_real_dlsym("SDL_SendWindowEvent");
+        NSDebugLog(@"[SDLHook] SDL_SendWindowEvent %s",
+                   ame_real_SendWindowEvent != NULL
+                       ? "available"
+                       : "not exported (fallback: PushEvent)");
+    }
+    if (ame_real_SendWindowEvent != NULL) {
+        bool sent = ame_real_SendWindowEvent(
+            window, AME_SDL_EVENT_WINDOW_RESIZED, (int32_t)pw, (int32_t)ph);
+        NSDebugLog(@"[SDLHook] SendWindowEvent RESIZED %dx%d px "
+                   @"(windowID=%u, %s)", pw, ph, wid,
+                   sent ? "sent" : "rejected");
+        if (sent) return true;
+    }
+
     ame_SDL_Event ev;
     memset(&ev, 0, sizeof(ev));
     ev.window.type = AME_SDL_EVENT_WINDOW_RESIZED;
-    ev.window.windowID =
-        (ame_real_GetWindowID != NULL) ? ame_real_GetWindowID(window) : 0u;
+    ev.window.windowID = wid;
     ev.window.data1 = (int32_t)pw;
     ev.window.data2 = (int32_t)ph;
 
@@ -704,21 +734,18 @@ static bool ame_SDL_InitSubSystem(uint32_t flags) {
 // 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale，
 // 而 EGL surface 由 SurfaceViewController 的 layer 独立创建，两者对不上 → 黑屏。
 //
-// —— 窗口尺寸按 points 传给 SDL，尺寸语义由查询 hook 统一到 GLFW ——
+// —— 窗口尺寸直接取 EGL surface 的像素尺寸，使三者回到同一坐标系 ——
 // GLFW 路径一切正常的根源：glfwGetWindowSize() 与 glfwGetFramebufferSize()
-// 返回同一个值（同取 internalGetWindow(window).width，即物理像素），于是 MC
-// 用于 GUI 布局的「窗口尺寸」与用于渲染的「framebuffer 尺寸」恒等。
+// 返回同一个值（同取 internalGetWindow(window).width，即物理像素），于是
+// GUI 布局、渲染区域、输入坐标共处同一坐标系。
 //
-// SDL3 路径要达到同样的效果，必须两件事同时成立：
-//   1) 这里传给 SDL_SetWindowSize 的是 points（全屏逻辑尺寸 812x375）——
-//      SDL 会自行乘 UIScreen.scale 得到像素，内部状态保持自洽，视图铺满屏幕；
-//   2) SDL_GetWindowSize / SDL_GetWindowSizeInPixels 都接回报 EGL surface 的
-//      真实像素尺寸（见各自函数处注释），使 MC 看到的两者相等。
+// SDL3 路径此前把窗口设成视图 bounds（812x375 points，见日志
+// "reused window resize 320x480 -> 812x375"），而查询 hook 回报的是 EGL
+// surface（2436x1124）、输入桥又按物理像素上报（日志中 HotbarDiag 的
+// x=2129 远超 812）—— 三个坐标系互相分裂。
 //
-// 早前这里直接传物理像素(2436x1124)，SDL 把它当逻辑尺寸存下，于是
-// window size = 2436x1124 而 framebuffer = EGL surface（25% 时仅 609x281）：
-// GUI 按 2436 布局却只渲染进 609 的区域 —— 表现为「25% 时过大超出屏幕」。
-// 传 points + 接管查询，两者对齐，任意分辨率下都与 GLFW 语义一致。
+// 这里改为直接采用 EGL surface 的像素尺寸。视图仍会被强制拉回全屏逻辑尺寸
+// （见下方 sdlView.frame），故不影响显示铺满；渲染区域由 EGL surface 决定。
 static void ame_syncReusedWindowSize(void *window, int w, int h) {
     if (window == NULL || w <= 0 || h <= 0) return;
 
@@ -732,10 +759,25 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
 
     // 窗口尺寸 = 全屏逻辑尺寸(points)。真实的像素语义由
     // SDL_GetWindowSize / SDL_GetWindowSizeInPixels 的接管统一给出（= EGL surface）。
+    // 窗口尺寸必须等于 EGL surface 的像素尺寸 —— 这正是 GLFW 路径一切正常的
+    // 根源：window size 与 framebuffer size 恒等，于是 GUI 布局、渲染区域、
+    // 输入坐标三者共处同一个坐标系。此前这里用的是视图 bounds（812x375 points），
+    // 而查询 hook 回报的是 EGL surface（2436x1124）、输入桥又按物理像素上报，
+    // 三个坐标系分裂 —— 同时表现为「画面缩在左上角」与「鼠标越界 REJECT」。
+    //
+    // 不可用全屏逻辑尺寸代替：分辨率 75% 时 EGL surface 只有 1827x843，
+    // 若窗口仍按 2436x1124 布局，GUI 会超出可视区（即早前「25% 过大」的现象）。
     int targetW = w, targetH = h;
-    if (gsv != nil && gsv.bounds.size.width > 0.0 && gsv.bounds.size.height > 0.0) {
-        targetW = (int)round(gsv.bounds.size.width);
-        targetH = (int)round(gsv.bounds.size.height);
+    int surfW = 0, surfH = 0;
+    if (ame_eglSurfacePixelSize(&surfW, &surfH) && surfW > 0 && surfH > 0) {
+        targetW = surfW;
+        targetH = surfH;
+    } else if (gsv != nil && gsv.bounds.size.width > 0.0 &&
+               gsv.bounds.size.height > 0.0) {
+        CGFloat sc = [UIScreen mainScreen].scale;
+        if (sc <= 0.0) sc = 1.0;
+        targetW = (int)round(gsv.bounds.size.width  * sc);
+        targetH = (int)round(gsv.bounds.size.height * sc);
     }
 
     if (ame_real_SetWindowSize == NULL) {
@@ -1235,12 +1277,17 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
         }
     }
 
+    // 无条件记录前若干次：MC 实际设置的 viewport 是什么，是判断「小窗」成因的
+    // 唯一直接证据。若这里打印的值已等于 EGL surface，问题就不在 viewport，
+    // 而在呈现环节（layer 尺寸 / 视图层级），需换方向查。
+    if (ame_glViewportLogBudget > 0) {
+        ame_glViewportLogBudget--;
+        NSDebugLog(@"[SDLHook] glViewport %dx%d (egl surface %dx%d, %s)",
+                   width, height, eglW, eglH,
+                   !haveSurface ? "no surface"
+                                : (bad ? (why != NULL ? why : "bad") : "ok"));
+    }
     if (bad) {
-        if (ame_glViewportLogBudget > 0) {
-            ame_glViewportLogBudget--;
-            NSDebugLog(@"[SDLHook] glViewport %dx%d -> %dx%d (%s)",
-                       width, height, eglW, eglH, why != NULL ? why : "?");
-        }
         width = (int32_t)eglW;
         height = (int32_t)eglH;
     }
