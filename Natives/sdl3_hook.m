@@ -70,6 +70,7 @@ typedef void *(*ame_fn_SDL_CreateWindow)(const char *title, int w, int h, uint32
 typedef void *(*ame_fn_SDL_CreateWindowWithProperties)(uint32_t props);
 typedef void (*ame_fn_SDL_DestroyWindow)(void *window);
 typedef bool (*ame_fn_SDL_SetWindowSize)(void *window, int w, int h);
+typedef bool (*ame_fn_SDL_GetWindowSize)(void *window, int *w, int *h);
 typedef long long (*ame_fn_SDL_GetNumberProperty)(uint32_t props, const char *name,
                                                   long long default_value);
 typedef void *(*ame_fn_SDL_LoadFunction)(void *handle, const char *name);
@@ -114,6 +115,7 @@ static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
 static ame_fn_SDL_DestroyWindow ame_real_DestroyWindow = NULL;
 static ame_fn_SDL_SetWindowSize ame_real_SetWindowSize = NULL;
+static ame_fn_SDL_GetWindowSize ame_real_GetWindowSize = NULL;
 static ame_fn_SDL_GetNumberProperty ame_real_GetNumberProperty = NULL;
 static ame_fn_SDL_LoadFunction ame_real_LoadFunction = NULL;
 static ame_fn_SDL_EGL_GetProcAddress ame_real_EGL_GetProcAddress = NULL;
@@ -353,6 +355,33 @@ static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
     return false;
 }
 
+// —— 窗口尺寸(points 语义)也必须回报 EGL surface 的像素尺寸 ——
+// GLFW 路径下 glfwGetWindowSize() 与 glfwGetFramebufferSize() 返回同一个值：
+// 两者都取 internalGetWindow(window).width，而该字段来自
+// glfw.windowSize / cacio.managed.screensize，即启动器传入的物理像素。
+// 于是 MC 用于 GUI 布局的「窗口尺寸」与用于渲染的「framebuffer 尺寸」恒等，
+// 无论分辨率设成多少都不会错位 —— 这正是 GLFW 路径一切正常的原因。
+//
+// SDL3 路径下若放任 SDL 回报 points(812x375)，则
+//     window size = 812x375      （GUI 布局 / 鼠标坐标空间）
+//     framebuffer = EGL surface  （随 resolutionScale 变化）
+// 两者不等，画面便会缩在角落或超出屏幕：25% 时 GUI 按 2436 的宽度布局、却
+// 只渲染进 609 宽的区域，于是按钮「过大超出屏幕」。
+// 这里因此与 GetWindowSizeInPixels 回报同一个值，对齐 GLFW 语义。
+// 只改查询返回值，不触碰 SDL 内部状态，SDL 自身仍然自洽。
+static bool ame_SDL_GetWindowSize(void *window, int *w, int *h) {
+    int sw = 0, sh = 0;
+    if (ame_eglSurfacePixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
+    if (ame_real_GetWindowSize != NULL) {
+        return ame_real_GetWindowSize(window, w, h);
+    }
+    return false;
+}
+
 // —— 为什么要接管这两个查询 ——
 // MC 的 viewport / framebuffer 尺寸来自它们。SDL 内部把「像素密度」固定为
 // UIScreen.scale（本设备 3.0），完全不知道启动器的 resolutionScale，
@@ -537,20 +566,21 @@ static bool ame_SDL_InitSubSystem(uint32_t flags) {
 // 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale，
 // 而 EGL surface 由 SurfaceViewController 的 layer 独立创建，两者对不上 → 黑屏。
 //
-// —— 窗口尺寸必须用像素，而不是 points（对齐 ZL2 / 安卓与 GLFW）——
-// ZL2 的 SDLSurface.nativeResize() 调用
-//     SDLActivity.nativeSetScreenResolution(surfaceW, surfaceH,
-//                                           deviceW, deviceH, density, rate)
-// 把"窗口尺寸"直接定义成 Surface 的像素尺寸，而非 points；GLFW 路径下
-// glfwGetWindowSize() 同样返回物理像素。两者因此都不会把逻辑尺寸误当成渲染尺寸。
+// —— 窗口尺寸按 points 传给 SDL，尺寸语义由查询 hook 统一到 GLFW ——
+// GLFW 路径一切正常的根源：glfwGetWindowSize() 与 glfwGetFramebufferSize()
+// 返回同一个值（同取 internalGetWindow(window).width，即物理像素），于是 MC
+// 用于 GUI 布局的「窗口尺寸」与用于渲染的「framebuffer 尺寸」恒等。
 //
-// 早前这里按 SDL 的 points 语义设成全屏逻辑尺寸(812x375)，SDL 随即派发
-// RESIZED(812x375)，MC 便据此设置 viewport —— 而 EGL surface 是 2436x1124，
-// 画面于是只占屏幕一角（约 1/9 面积）。现改为全屏物理像素，与 ZL2/安卓、GLFW
-// 语义一致：窗口尺寸恒定 → GUI 布局稳定；渲染像素随分辨率变 → 可自由缩放。
+// SDL3 路径要达到同样的效果，必须两件事同时成立：
+//   1) 这里传给 SDL_SetWindowSize 的是 points（全屏逻辑尺寸 812x375）——
+//      SDL 会自行乘 UIScreen.scale 得到像素，内部状态保持自洽，视图铺满屏幕；
+//   2) SDL_GetWindowSize / SDL_GetWindowSizeInPixels 都接回报 EGL surface 的
+//      真实像素尺寸（见各自函数处注释），使 MC 看到的两者相等。
 //
-// 注意取原生 scale 而非 layer.contentsScale：后者含 resolutionScale，若乘上去
-// 会让窗口尺寸随分辨率变化，GUI 布局跟着变（正是要避免的）。
+// 早前这里直接传物理像素(2436x1124)，SDL 把它当逻辑尺寸存下，于是
+// window size = 2436x1124 而 framebuffer = EGL surface（25% 时仅 609x281）：
+// GUI 按 2436 布局却只渲染进 609 的区域 —— 表现为「25% 时过大超出屏幕」。
+// 传 points + 接管查询，两者对齐，任意分辨率下都与 GLFW 语义一致。
 static void ame_syncReusedWindowSize(void *window, int w, int h) {
     if (window == NULL || w <= 0 || h <= 0) return;
 
@@ -562,13 +592,12 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
         if ([obj isKindOfClass:[UIView class]]) gsv = (UIView *)obj;
     }
 
-    // 窗口尺寸 = 全屏物理像素（恒定，不随 resolutionScale 变化）
+    // 窗口尺寸 = 全屏逻辑尺寸(points)。真实的像素语义由
+    // SDL_GetWindowSize / SDL_GetWindowSizeInPixels 的接管统一给出（= EGL surface）。
     int targetW = w, targetH = h;
     if (gsv != nil && gsv.bounds.size.width > 0.0 && gsv.bounds.size.height > 0.0) {
-        CGFloat native = [UIScreen mainScreen].scale;
-        if (!(native > 0.0)) native = 1.0;
-        targetW = (int)round(gsv.bounds.size.width  * native);
-        targetH = (int)round(gsv.bounds.size.height * native);
+        targetW = (int)round(gsv.bounds.size.width);
+        targetH = (int)round(gsv.bounds.size.height);
     }
 
     if (ame_real_SetWindowSize == NULL) {
@@ -580,16 +609,15 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
         ok = ame_real_SetWindowSize(window, targetW, targetH);
     }
 
-    // SetWindowSize 之后 SDL 会按自身换算调整视图；这里把视图强制回全屏逻辑尺寸
-    // 并把密度归一，使显示仍铺满屏幕（真正的渲染尺寸由 EGL surface 决定）。
+    // SetWindowSize 之后 SDL 会按自身换算调整视图；这里把视图强制回全屏逻辑尺寸，
+    // 使显示铺满屏幕（真正的渲染尺寸由 EGL surface 决定，与此处无关）。
+    //
+    // 注意：不要把 contentScaleFactor 强行归一为 1.0。窗口尺寸既已按 points 传入，
+    // 归一只会让 SDL 内部的像素空间从 2436x1124 缩到 812x375，输入坐标（其空间为
+    // EGL surface 的像素尺寸）更容易被判为越界，进而触发 SDL 清除 mouse->focus
+    // —— 即 ZL2 注释里提到的「虚拟鼠标坐标超过 SDL window 尺寸」问题。
     UIView *sdlView = ame_findSDLView(gsv);
     if (sdlView != nil) {
-        if (fabs((double)sdlView.contentScaleFactor - 1.0) > 0.001) {
-            CGFloat old = sdlView.contentScaleFactor;
-            sdlView.contentScaleFactor = 1.0;
-            NSDebugLog(@"[SDLHook] SDL view contentScaleFactor %.3f -> 1.000 "
-                       @"(window sized in pixels)", old);
-        }
         if (gsv != nil && gsv.bounds.size.width > 0.0) {
             CGRect full = CGRectMake(0.0, 0.0,
                                      gsv.bounds.size.width,
@@ -1091,6 +1119,16 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
             ame_real_UnloadObject = (ame_fn_SDL_UnloadObject)amethyst_orig_dlsym(handle, name);
         }
         return (void *)ame_SDL_UnloadObject;
+    }
+    // 窗口尺寸(points 语义)：同样无条件接管。GLFW 路径下窗口尺寸与
+    // framebuffer 尺寸恒等，这里回报同一个值以对齐该语义（见函数处注释）。
+    if (strcmp(name, "SDL_GetWindowSize") == 0) {
+        if (ame_real_GetWindowSize == NULL) {
+            ame_real_GetWindowSize =
+                (ame_fn_SDL_GetWindowSize)amethyst_orig_dlsym(handle, name);
+        }
+        NSDebugLog(@"[SDLHook] hooked SDL_GetWindowSize -> EGL surface size");
+        return (void *)ame_SDL_GetWindowSize;
     }
     // 尺寸查询：与 GL 后端无关，无条件接管（见函数处注释）
     if (strcmp(name, "SDL_GetWindowSizeInPixels") == 0) {
