@@ -324,6 +324,18 @@ static UIView *ame_findSDLView(UIView *from) {
 // 症状：「默认 100% 黑屏，先调 75% 画面才出现，再调回 100% 才正常」。
 //
 // 因此兜底必须给出「合理的全屏像素」，而不是把 SDL 的内部值交回去。
+
+// 尺寸查询日志限流：MC 每帧会多次查询，全量打印会淹没日志。
+// 只保留前若干次，足以看清 MC 实际拿到的是什么值。
+static int ame_sizeLogBudget = 16;
+#define AME_SIZE_LOG(fmt, ...)                                  \
+    do {                                                        \
+        if (ame_sizeLogBudget > 0) {                            \
+            ame_sizeLogBudget--;                                \
+            NSDebugLog((fmt), ##__VA_ARGS__);                   \
+        }                                                       \
+    } while (0)
+
 static bool ame_screenFallbackPixelSize(int *outW, int *outH) {
     if (outW == NULL || outH == NULL) return false;
     UIScreen *screen = [UIScreen mainScreen];
@@ -400,6 +412,7 @@ static bool ame_SDL_GetWindowSize(void *window, int *w, int *h) {
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
+        AME_SIZE_LOG(@"[SDLHook] GetWindowSize -> %dx%d (EGL surface)", sw, sh);
         return true;
     }
     // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
@@ -432,6 +445,8 @@ static bool ame_SDL_GetWindowSizeInPixels(void *window, int *w, int *h) {
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
+        AME_SIZE_LOG(@"[SDLHook] GetWindowSizeInPixels -> %dx%d (EGL surface)",
+                     sw, sh);
         return true;
     }
     // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
@@ -452,6 +467,8 @@ static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
+        AME_SIZE_LOG(@"[SDLHook] GL_GetDrawableSize -> %dx%d (EGL surface)",
+                     sw, sh);
         return true;
     }
     // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
@@ -1160,10 +1177,93 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
     return true;
 }
 
+// —— viewport 兜底：在尺寸交给 GL 的最后一步修正 ——
+//
+// 三个尺寸查询（SDL_GetWindowSize / GetWindowSizeInPixels /
+// GL_GetDrawableSize）都已接管，回报 EGL surface 的真实像素。但 MC 未必在
+// 正确的时机重新查询：它可能沿用建窗阶段缓存的值，也可能取窗口事件里的
+// data1/data2。一旦拿到的是 SDL 内部的 points(812x375) 或隐藏工具窗口的
+// 320x480，画面就只占屏幕左上角一小块，且必须手动改一次分辨率才恢复。
+//
+// 与其继续猜测 MC 从哪条路径取尺寸，不如在落地点兜底：glViewport 是 MC
+// 把尺寸交给 GL 的最后一步，在这里改写即可保证渲染区域恒等于 EGL surface。
+//
+// 判定刻意保守 —— 只精确匹配「已知的错误候选」，不做比例推断，以免误伤
+// 渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
+typedef void (*ame_fn_glViewport)(int32_t x, int32_t y,
+                                  int32_t width, int32_t height);
+
+static ame_fn_glViewport ame_real_glViewport = NULL;
+static int ame_glViewportLogBudget = 8;
+
+static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
+    if (ame_real_glViewport == NULL) {
+        return;
+    }
+
+    int eglW = 0, eglH = 0;
+    bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
+
+    bool bad = false;
+    const char *why = NULL;
+    int sdlW = 0, sdlH = 0;
+    int pxW = 0, pxH = 0;
+    if (haveSurface && width > 0 && height > 0 &&
+        (width != eglW || height != eglH)) {
+        // 候选一：MC 把 SDL 内部的 points 当成了像素
+        if (ame_primaryWindow != NULL && ame_real_GetWindowSize != NULL &&
+            ame_real_GetWindowSize(ame_primaryWindow, &sdlW, &sdlH) &&
+            sdlW > 0 && sdlH > 0 && width == sdlW && height == sdlH) {
+            bad = true;
+            why = "SDL window points used as pixels";
+        }
+        // 候选二：建窗阶段缓存的隐藏工具窗口尺寸
+        if (!bad && ((width == 320 && height == 480) ||
+                     (width == 480 && height == 320))) {
+            bad = true;
+            why = "hidden utility window size";
+        }
+        // 候选三：SDL 自己换算的像素尺寸（points x UIScreen.scale）。
+        // SDL 完全不知道启动器的 resolutionScale，故只有 100% 时才与
+        // EGL surface 相等 —— 这正是 75%/25% 下画面被裁/超出的来源。
+        if (!bad && ame_primaryWindow != NULL &&
+            ame_real_GetWindowSizeInPixels != NULL &&
+            ame_real_GetWindowSizeInPixels(ame_primaryWindow, &pxW, &pxH) &&
+            pxW > 0 && pxH > 0 && width == pxW && height == pxH) {
+            bad = true;
+            why = "SDL pixel size (ignores resolutionScale)";
+        }
+    }
+
+    if (bad) {
+        if (ame_glViewportLogBudget > 0) {
+            ame_glViewportLogBudget--;
+            NSDebugLog(@"[SDLHook] glViewport %dx%d -> %dx%d (%s)",
+                       width, height, eglW, eglH, why != NULL ? why : "?");
+        }
+        width = (int32_t)eglW;
+        height = (int32_t)eglH;
+    }
+
+    ame_real_glViewport(x, y, width, height);
+}
+
 // GL 函数必须来自渲染器自身。若误返回系统 GLES / EAGL 的实现，
 // LWJGL 拿到的函数指针与 EGL 上下文不匹配，会直接崩。
 static void *ame_SDL_GL_GetProcAddress(const char *proc) {
     if (proc == NULL) return NULL;
+    // glViewport 走我们的包装：它是 MC 把窗口尺寸交给 GL 的最后一步，
+    // 在此兜底可确保渲染区域恒等于 EGL surface（见 ame_glViewport 处注释）。
+    if (strcmp(proc, "glViewport") == 0) {
+        if (ame_real_glViewport == NULL) {
+            void *rh = ame_rendererHandle();
+            if (rh != NULL)
+                ame_real_glViewport = (ame_fn_glViewport)dlsym(rh, proc);
+            if (ame_real_glViewport == NULL)
+                ame_real_glViewport = (ame_fn_glViewport)dlsym(RTLD_DEFAULT, proc);
+        }
+        if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
+    }
     void *h = ame_rendererHandle();
     if (h != NULL) {
         void *p = dlsym(h, proc);
@@ -1197,6 +1297,21 @@ static void *ame_SDL_GL_GetCurrentContext(void) {
 /// 返回非 NULL 表示本模块接管了该符号；否则返回 NULL 让调用方走原路径。
 void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     if (name == NULL) return NULL;
+
+    // glViewport 兜底：LWJGL 既可能走 SDL_GL_GetProcAddress（已在那里接管），
+    // 也可能直接 dlsym 取 GL 入口。这里双保险，确保两条路都拿到包装版本。
+    // 拿不到真实指针时返回 NULL（= 不接管），由调用方回落原始 dlsym 结果。
+    if (strcmp(name, "glViewport") == 0) {
+        if (ame_real_glViewport == NULL) {
+            ame_real_glViewport =
+                (ame_fn_glViewport)amethyst_orig_dlsym(handle, name);
+            if (ame_real_glViewport == NULL)
+                ame_real_glViewport =
+                    (ame_fn_glViewport)amethyst_orig_dlsym(RTLD_DEFAULT, name);
+        }
+        if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
+        return NULL;
+    }
 
     // 先记下真实指针（无论本次是否接管，后续包装都要用到）
     if (strcmp(name, "SDL_CreateWindow") == 0) {
