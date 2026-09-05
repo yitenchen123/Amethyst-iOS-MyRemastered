@@ -2237,6 +2237,78 @@ static UIView *findSDL_uikitview(UIView *root) {
     return nil;
 }
 
+#pragma mark - SDL3 渲染层（MC 26.3+ OpenGL 后端黑屏修复）
+
+// libSDL3 的嵌入逻辑（Amethyst_EmbedSDLViewIntoHostWindow）在把 SDL 视图挂进
+// 启动器层级时，会执行 gameSurface.hidden = YES —— gameSurface 就是从
+// rootViewController 往下找到的第一个 GameSurfaceView，也就是 self.surfaceView
+// （= pojavWindow = +[SurfaceViewController surface]）。
+//
+// 这对 Vulkan 后端是正确的（它走 SDL 自带的 metalview 呈现），但对 OpenGL 后端
+// 是致命的：gl_bridge 的 gl_init_context() 把 EGL surface 绑在
+// SurfaceViewController.surface.layer 上，宿主 view 一隐藏，ANGLE 渲染出来的画面
+// 就无处呈现 —— 表现为画面全黑，而输入、声音、资源加载全部正常。
+//
+// 下面两个函数供 gl_bridge 在建 EGL surface 前调用。它们都只在能找到
+// SDL_uikitview 时才动作，因此 GLFW 路径（1.21.1 及更低版本）完全不受影响：
+// 那里根本没有 SDL 视图，函数直接返回 NO / nil，gl_bridge 沿用原逻辑。
+
+// 找到当前嵌入的 SDL 视图；非 SDL3 路径返回 nil。
+static UIView *Amethyst_FindSDLView(void) {
+    UIWindow *host = nil;
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive ||
+                ![scene isKindOfClass:UIWindowScene.class]) {
+                continue;
+            }
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (!w.hidden && w.rootViewController != nil) { host = w; break; }
+            }
+            if (host) break;
+        }
+    }
+    if (!host) host = UIApplication.sharedApplication.keyWindow;
+
+    UIView *root = host.rootViewController.view;
+    if (!root && pojavWindow != nil) root = pojavWindow.window.rootViewController.view;
+    if (!root) return nil;
+    return findSDL_uikitview(root);
+}
+
+// 补救方式 (1)（默认）：保持 EGL 绑在 GameSurfaceView 上，仅取消隐藏并提到
+// SDL 视图之上。分辨率沿用启动器配置的 drawableSize / contentsScale。
+// 返回 YES 表示确实执行了补救（即当前是 SDL3 路径）。
+BOOL Amethyst_RestoreGameSurfaceVisibility(void) {
+    if (pojavWindow == nil) return NO;
+    UIView *sdlView = Amethyst_FindSDLView();
+    if (!sdlView) return NO;                 // 非 SDL3 路径：不改动任何状态
+    UIView *container = pojavWindow.superview;
+    if (!container) return NO;
+
+    pojavWindow.hidden = NO;
+    [container bringSubviewToFront:pojavWindow];
+    NSLog(@"[SurfaceVC] SDL3 path: GameSurfaceView unhidden and raised above SDL view");
+    return YES;
+}
+
+// 补救方式 (2)（AMETHYST_EGL_SURFACE_LAYER=sdl）：直接给出 SDL 自己的可见
+// CAMetalLayer，让 EGL surface 绑到它上面。非 SDL3 路径返回 nil。
+CALayer *Amethyst_SDL3RenderLayer(void) {
+    UIView *sdlView = Amethyst_FindSDLView();
+    if (!sdlView) return nil;
+    // SDL 的实际呈现层是嵌在 SDL_uikitview 里的 SDL_uikitmetalview
+    Class metalCls = NSClassFromString(@"SDL_uikitmetalview");
+    if (metalCls) {
+        for (UIView *sub in sdlView.subviews) {
+            if ([sub isKindOfClass:metalCls]) {
+                return sub.layer;
+            }
+        }
+    }
+    return sdlView.layer;
+}
+
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
 

@@ -9,6 +9,11 @@
 #include "gl_bridge.h"
 #include "utils.h"
 
+// 由 Natives/SurfaceViewController.m 提供，用于修正 SDL3 嵌入导致的 OpenGL 后端黑屏。
+// 详见下方 gl_init_context() 中的说明。GLFW 路径（1.21.1 等）下两者均为空操作。
+extern BOOL Amethyst_RestoreGameSurfaceVisibility(void);
+extern CALayer *Amethyst_SDL3RenderLayer(void);
+
 static EGLDisplay g_EglDisplay;
 static egl_library handle;
 
@@ -234,6 +239,44 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     if (!bindResult) NSDebugLog(@"EGLBridge: bind failed: %p\n", handle.eglGetError());
 
     CALayer *layer = SurfaceViewController.surface.layer;
+
+    // SDL3（MC 26.3+）黑屏修复。
+    //
+    // libSDL3 的嵌入逻辑（Amethyst_EmbedSDLViewIntoHostWindow）在把 SDL 视图挂进
+    // 启动器层级时，会把 GameSurfaceView 设为 hidden，好让 SDL 的视图顶替它显示。
+    // 但 OpenGL 后端下 EGL surface 正是绑在 GameSurfaceView 的 CAMetalLayer 上
+    // （也就是上面这行拿到的 layer）——宿主 view 不可见，ANGLE 的渲染结果就无从
+    // 呈现，表现为「画面全黑但输入正常」。Vulkan 后端不受影响，因为它走 SDL 自带
+    // 的 metalview，本来就是可见的那一层；1.21.1 的 GLFW 路径没有 SDL 视图，
+    // GameSurfaceView 始终可见，所以也正常。
+    //
+    // 两种补救方式：
+    //   (1) 默认：保持绑在 GameSurfaceView 上，仅取消隐藏并提到 SDL 视图之上。
+    //       分辨率沿用启动器配置的 drawableSize / contentsScale（尊重用户的
+    //       分辨率缩放设置），改动面最小。
+    //   (2) AMETHYST_EGL_SURFACE_LAYER=sdl：直接改绑 SDL 自己的 CAMetalLayer。
+    //       注意该层由 SDL 以全分辨率创建（iPhone X 上为 2436x1125 @3x），
+    //       会绕过启动器的分辨率缩放，性能开销明显更大。仅在 (1) 无效时试用。
+    //
+    // 两个函数都只在检测到 SDL_uikitview 时才动作，非 SDL3 路径恒为空操作。
+    const char *layerMode = getenv("AMETHYST_EGL_SURFACE_LAYER");
+    BOOL useSDLLayer = (layerMode != NULL && strcmp(layerMode, "sdl") == 0);
+    CALayer *sdlLayer = useSDLLayer ? Amethyst_SDL3RenderLayer() : nil;
+    if (sdlLayer != nil) {
+        layer = sdlLayer;
+        NSLog(@"[gl_bridge] SDL3 path: binding EGL surface to SDL CAMetalLayer "
+              @"(mode=sdl, %.0fx%.0f @%.2fx)",
+              sdlLayer.bounds.size.width * sdlLayer.contentsScale,
+              sdlLayer.bounds.size.height * sdlLayer.contentsScale,
+              sdlLayer.contentsScale);
+    } else if (Amethyst_RestoreGameSurfaceVisibility()) {
+        NSLog(@"[gl_bridge] SDL3 path: restored GameSurfaceView above SDL view "
+              @"(mode=default, %.0fx%.0f @%.2fx)",
+              layer.bounds.size.width * layer.contentsScale,
+              layer.bounds.size.height * layer.contentsScale,
+              layer.contentsScale);
+    }
+
     // MobileGL 的 eglCreateWindowSurface 不会从 CALayer 推断尺寸，必须显式给出
     // 像素宽高（乘 contentsScale，与 drawableSize 保持一致），否则 surface 会按
     // 1x1 创建，进世界后画面异常。其余渲染器从 layer 自行推断，传 NULL。
