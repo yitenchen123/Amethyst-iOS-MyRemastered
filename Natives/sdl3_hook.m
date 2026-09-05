@@ -67,6 +67,9 @@ typedef bool (*ame_fn_SDL_GL_SetAttribute)(int attr, int value);
 typedef void *(*ame_fn_SDL_CreateWindow)(const char *title, int w, int h, uint32_t flags);
 typedef void *(*ame_fn_SDL_CreateWindowWithProperties)(uint32_t props);
 typedef void (*ame_fn_SDL_DestroyWindow)(void *window);
+typedef bool (*ame_fn_SDL_SetWindowSize)(void *window, int w, int h);
+typedef long long (*ame_fn_SDL_GetNumberProperty)(uint32_t props, const char *name,
+                                                  long long default_value);
 typedef void *(*ame_fn_SDL_LoadFunction)(void *handle, const char *name);
 typedef void *(*ame_fn_SDL_EGL_GetProcAddress)(const char *proc);
 typedef void *(*ame_fn_SDL_LoadObject)(const char *path);
@@ -86,6 +89,8 @@ static ame_fn_SDL_GL_SetAttribute ame_real_GL_SetAttribute = NULL;
 static ame_fn_SDL_CreateWindow ame_real_CreateWindow = NULL;
 static ame_fn_SDL_CreateWindowWithProperties ame_real_CreateWindowWithProperties = NULL;
 static ame_fn_SDL_DestroyWindow ame_real_DestroyWindow = NULL;
+static ame_fn_SDL_SetWindowSize ame_real_SetWindowSize = NULL;
+static ame_fn_SDL_GetNumberProperty ame_real_GetNumberProperty = NULL;
 static ame_fn_SDL_LoadFunction ame_real_LoadFunction = NULL;
 static ame_fn_SDL_EGL_GetProcAddress ame_real_EGL_GetProcAddress = NULL;
 static ame_fn_SDL_LoadObject ame_real_LoadObject = NULL;
@@ -159,7 +164,15 @@ static bool ame_sdlGlesCompatEnabled(void) {
     if (strcmp(renderer, "vulkan_zink") == 0) return false;       // zink
     if (strstr(renderer, "libMoltenVK") != NULL) return false;    // 原生 Vulkan
     if (strncmp(renderer, "opengles", 8) == 0) return true;       // 内置 GL4ES
-    if (strstr(renderer, "libMobileGL") != NULL) return true;     // MobileGL 双后端
+    if (strstr(renderer, "libMobileGL") != NULL) {
+        // MobileGL 双后端必须按实现区分，不能按文件名前缀一刀切：
+        //   libMobileGL-gles.dylib → DirectGLES，本身就是 ES 实现 → 强制 ES
+        //   libMobileGL.dylib      → DirectVulkan，对外声明 GL 4.6 再转 Vulkan，
+        //                            与 vulkan_zink 同类。ZL2 对 vulkan_zink
+        //                            明确返回 false，此处对齐 —— 给 GL→Vulkan
+        //                            转译器套 ES 上下文与 ZL2 的做法相反。
+        return strstr(renderer, "-gles") != NULL;
+    }
     if (strstr(renderer, "libmithril") != NULL) return true;      // Mithril
     return ame_isMobileGluesEgl();                                // MobileGlues
 }
@@ -198,12 +211,59 @@ static void ame_forceEglProfileEs(void) {
 
 static void *ame_primaryWindow = NULL;
 static unsigned int ame_primaryWindowRefs = 0;
+static int ame_primaryWindowW = 0;
+static int ame_primaryWindowH = 0;
 
 static bool ame_shouldReusePrimaryWindow(void) {
-    // 仅对移动 ES 渲染器生效。zink / OSMesa 目前工作正常，任何窗口行为的改动
-    // 都不能波及它们 —— 这条链路不经过 EGL，本文件的兼容逻辑对它没有意义。
-    if (!ame_sdlGlesCompatEnabled()) return false;
-    return ame_envFlagOn("AMETHYST_SDL_REUSE_WINDOW", true);
+    // 判定必须与 ame_sdlGlesCompatEnabled() 解耦 —— 这是从 ZL2 对齐来的关键差异，
+    // ZL2 的 shouldReusePrimaryWindow() 只看环境变量，不看 sdlGlesCompatEnabled()。
+    //
+    // 若沿用耦合写法，一旦把 DirectVulkan（libMobileGL.dylib）移出 ES 强制，
+    // 复用会连带被关闭；而 iOS 的 UIKit_CreateWindow 硬性限制每 display 只允许
+    // 一个窗口（"Only one window allowed per display."），主窗口创建随即返回 NULL，
+    // MC 抛 "Failed to create window"（实测 AMETHYST_SDL_REUSE_WINDOW=0 即此结果）。
+    // 即"是否复用"取决于平台单窗口约束，"是否强制 ES"取决于渲染器实现，两回事。
+    if (!ame_envFlagOn("AMETHYST_SDL_REUSE_WINDOW", true)) return false;
+
+    // 仍排除桌面 / OSMesa 系：它们不经本文件的 EGL 兼容逻辑，改动无益且可能
+    // 波及已验证路径。
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (renderer != NULL && renderer[0] != '\0') {
+        if (strstr(renderer, "desktopgl") != NULL) return false;
+        if (strncmp(renderer, "gallium_", 8) == 0) return false;
+        if (strncmp(renderer, "libOSMesa", 9) == 0) return false;
+        if (strcmp(renderer, "vulkan_zink") == 0) return false;
+        if (strstr(renderer, "libMoltenVK") != NULL) return false;
+    }
+    return true;
+}
+
+// iOS 专有：ZL2 明确注释了"尺寸无需额外处理，由 Android Surface 决定（创建时即
+// 取 Surface 尺寸，与请求值无关）"。iOS 没有这个前提 —— SDL 的 UIKit 后端按
+// 请求值建窗口，于是 RenderPearl 那个隐藏工具窗口就是实打实的 320x480。
+//
+// 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale；
+// 而 EGL surface 由 SurfaceViewController 的 layer 独立创建（实测 1826x844），
+// 两者对不上 → 画面全黑（输入正常，因为控制层是启动器自己的 view）。
+// 故复用时必须把窗口尺寸同步成当前请求值。
+static void ame_syncReusedWindowSize(void *window, int w, int h) {
+    if (window == NULL || w <= 0 || h <= 0) return;
+    if (w == ame_primaryWindowW && h == ame_primaryWindowH) return;
+
+    bool ok = false;
+    if (ame_real_SetWindowSize == NULL) {
+        ame_real_SetWindowSize =
+            (ame_fn_SDL_SetWindowSize)ame_real_dlsym("SDL_SetWindowSize");
+    }
+    if (ame_real_SetWindowSize != NULL) {
+        ok = ame_real_SetWindowSize(window, w, h);
+    }
+    // 即便 SDL 侧拒绝调整，也记录请求值：后续复用比较以此为准，避免每次重复调用。
+    NSDebugLog(@"[SDLHook] reused window resize %dx%d -> %dx%d (%s)",
+               ame_primaryWindowW, ame_primaryWindowH, w, h,
+               ok ? "ok" : (ame_real_SetWindowSize ? "rejected" : "no SDL_SetWindowSize"));
+    ame_primaryWindowW = w;
+    ame_primaryWindowH = h;
 }
 
 #pragma mark - 3) EGL 兼容重试
@@ -352,12 +412,15 @@ static void *ame_SDL_CreateWindow(const char *title, int w, int h, uint32_t flag
         ame_primaryWindowRefs++;
         NSDebugLog(@"[SDLHook] reusing primary window %p, refs=%u",
                    ame_primaryWindow, ame_primaryWindowRefs);
+        ame_syncReusedWindowSize(ame_primaryWindow, w, h);
         return ame_primaryWindow;
     }
     void *wnd = ame_real_CreateWindow ? ame_real_CreateWindow(title, w, h, flags) : NULL;
     if (reuse && wnd != NULL) {
         ame_primaryWindow = wnd;
         ame_primaryWindowRefs = 1;
+        ame_primaryWindowW = w;
+        ame_primaryWindowH = h;
     }
     NSDebugLog(@"[SDLHook] SDL_CreateWindow -> %p", wnd);
     return wnd;
@@ -371,6 +434,17 @@ static void *ame_SDL_CreateWindowWithProperties(uint32_t props) {
         ame_primaryWindowRefs++;
         NSDebugLog(@"[SDLHook] reusing primary window %p, refs=%u",
                    ame_primaryWindow, ame_primaryWindowRefs);
+        // properties 版本的宽高需从 props 里取（SDL_PROP_WINDOW_CREATE_WIDTH/
+        // HEIGHT_NUMBER）。取不到就不改尺寸，行为与改动前一致。
+        if (ame_real_GetNumberProperty == NULL) {
+            ame_real_GetNumberProperty =
+                (ame_fn_SDL_GetNumberProperty)ame_real_dlsym("SDL_GetNumberProperty");
+        }
+        if (ame_real_GetNumberProperty != NULL) {
+            int pw = (int)ame_real_GetNumberProperty(props, "SDL.window.create.width", 0);
+            int ph = (int)ame_real_GetNumberProperty(props, "SDL.window.create.height", 0);
+            ame_syncReusedWindowSize(ame_primaryWindow, pw, ph);
+        }
         return ame_primaryWindow;
     }
     void *wnd = ame_real_CreateWindowWithProperties
@@ -379,6 +453,8 @@ static void *ame_SDL_CreateWindowWithProperties(uint32_t props) {
     if (reuse && wnd != NULL) {
         ame_primaryWindow = wnd;
         ame_primaryWindowRefs = 1;
+        ame_primaryWindowW = 0;
+        ame_primaryWindowH = 0;
     }
     NSDebugLog(@"[SDLHook] SDL_CreateWindowWithProperties -> %p", wnd);
     return wnd;
@@ -394,6 +470,8 @@ static void ame_SDL_DestroyWindow(void *window) {
         }
         ame_primaryWindow = NULL;
         ame_primaryWindowRefs = 0;
+        ame_primaryWindowW = 0;
+        ame_primaryWindowH = 0;
     }
     if (ame_real_DestroyWindow) ame_real_DestroyWindow(window);
 }
@@ -458,23 +536,14 @@ static void ame_SDL_UnloadObject(void *handle) {
 // vulkan_zink）与原生 Vulkan（libMoltenVK），因此 zink 在 26.3 上"回落 Vulkan"
 // 那条已验证可用的路径不会受到任何影响。
 //
-// 默认开启：接管后 MC 走 OpenGL 后端，渲染器以其声明的 GL 版本（MobileGL 对外
-// 声明 4.6）提供上下文。
-//
-// 曾默认关闭（实测结论）：接管后生成的桌面 GLSL 经 shaderc/glslang 编译时稳定
-// 崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致在
-// libshaderc.dylib +0x155820）。
-//
-// 关闭期间定位到诱因：libMobileGL.dylib 与 libshaderc.dylib 各含一份 glslang，
-// 前者以 RTLD_GLOBAL 载入时其 N_WEAK_DEF glslang 符号进入全局空间，被后者合并，
-// 二者共用线程局部 AST 内存池，MobileGL 销毁 TShader 时连带回收了 shaderc 仍在
-// 遍历的 AST 节点 -> 访问已释放内存。现两处 dlopen 对 MobileGL 改用 RTLD_LOCAL
-// 隔离符号（见 gl_bridge.m / egl_bridge.m），故重新默认开启。
-//
-// 若实测仍崩溃，可用 AMETHYST_SDL_GL_BRIDGE=0 回到"不接管 -> 回落 Vulkan"这条
-// 已验证可进世界的路径，无需重新构建。
+// 默认关闭（实测结论）：接管后 MC 走 OpenGL 后端，会要求渲染器以桌面 GL 提供
+// 上下文（MobileGL 对外声明 4.6），由此生成的桌面 GLSL 经 shaderc/glslang 编译
+// 时稳定崩溃（TGlslangToSpvTraverser::visitAggregate，多次实测崩溃地址完全一致）。
+// 不接管时 MC 回落 Vulkan（MoltenVK）可正常加载资源并进入世界。
+// 因此在修复 glslang 桌面 GLSL 路径之前默认不接管；需要继续试验时可用
+// AMETHYST_SDL_GL_BRIDGE=1 打开。
 static bool ame_glBridgeEnabled(void) {
-    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", true)) return false;
+    if (!ame_envFlagOn("AMETHYST_SDL_GL_BRIDGE", false)) return false;
 
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return false;
