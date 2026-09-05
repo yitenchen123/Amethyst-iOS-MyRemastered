@@ -312,6 +312,32 @@ static UIView *ame_findSDLView(UIView *from) {
 // 请求值建窗口，于是 RenderPearl 那个隐藏工具窗口就是实打实的 320x480。
 #pragma mark - EGL surface 真实像素尺寸
 
+// —— 尺寸兜底：绝不能回落到 SDL 内部记录的 320x480 ——
+//
+// MC 26.3 先建一个 320x480 的隐藏工具窗口（日志里是
+// "RenderPearl OpenGL Hidden Utility Window 320x480"），主窗口随后被重定向到它
+// （主窗口复用，见 ame_SDL_CreateWindow）。若此刻 EGL surface 尚未建立、
+// drawableSize 仍为 0，尺寸查询便会回落 SDL 自身记录的值 —— 也就是 320x480。
+//
+// MC 一旦把该值用于 viewport / GUI 布局，画面就只占屏幕左上角一小块，且必须
+// 手动改一次分辨率（触发重建 drawableSize 与重新查询）才恢复 —— 正是观察到的
+// 症状：「默认 100% 黑屏，先调 75% 画面才出现，再调回 100% 才正常」。
+//
+// 因此兜底必须给出「合理的全屏像素」，而不是把 SDL 的内部值交回去。
+static bool ame_screenFallbackPixelSize(int *outW, int *outH) {
+    if (outW == NULL || outH == NULL) return false;
+    UIScreen *screen = [UIScreen mainScreen];
+    if (screen == nil) return false;
+    CGRect b = screen.bounds;
+    CGFloat s = screen.scale;
+    if (s > 0.0 && b.size.width > 1.0 && b.size.height > 1.0) {
+        *outW = (int)round(b.size.width * s);
+        *outH = (int)round(b.size.height * s);
+        return true;
+    }
+    return false;
+}
+
 // 取 EGL surface 的真实像素尺寸 —— 即 CAMetalLayer.drawableSize，由启动器配成
 // physicalSize x resolutionScale。这是 ANGLE 实际渲染的分辨率。
 static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
@@ -352,7 +378,7 @@ static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
         *outH = (int)round(bs.height * scale);
         return true;
     }
-    return false;
+    return ame_screenFallbackPixelSize(outW, outH);
 }
 
 // —— 窗口尺寸(points 语义)也必须回报 EGL surface 的像素尺寸 ——
@@ -372,6 +398,13 @@ static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
 static bool ame_SDL_GetWindowSize(void *window, int *w, int *h) {
     int sw = 0, sh = 0;
     if (ame_eglSurfacePixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
+    // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
+    // 320x480（见 ame_screenFallbackPixelSize 处注释），MC 缓存后画面缩在角落。
+    if (ame_screenFallbackPixelSize(&sw, &sh)) {
         if (w != NULL) *w = sw;
         if (h != NULL) *h = sh;
         return true;
@@ -401,6 +434,13 @@ static bool ame_SDL_GetWindowSizeInPixels(void *window, int *w, int *h) {
         if (h != NULL) *h = sh;
         return true;
     }
+    // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
+    // 320x480（见 ame_screenFallbackPixelSize 处注释），MC 缓存后画面缩在角落。
+    if (ame_screenFallbackPixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
     if (ame_real_GetWindowSizeInPixels != NULL) {
         return ame_real_GetWindowSizeInPixels(window, w, h);
     }
@@ -414,10 +454,91 @@ static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
         if (h != NULL) *h = sh;
         return true;
     }
+    // 先按主屏物理分辨率兜底：直接交回 SDL 原函数会拿到隐藏工具窗口的
+    // 320x480（见 ame_screenFallbackPixelSize 处注释），MC 缓存后画面缩在角落。
+    if (ame_screenFallbackPixelSize(&sw, &sh)) {
+        if (w != NULL) *w = sw;
+        if (h != NULL) *h = sh;
+        return true;
+    }
     if (ame_real_GL_GetDrawableSize != NULL) {
         return ame_real_GL_GetDrawableSize(window, w, h);
     }
     return false;
+}
+
+// —— 补发窗口尺寸事件（思路来自 FCL 93bba5a）——
+//
+// FCL 那个提交修的不是"算出正确尺寸"，而是"补发通知"：初始化时 SDL 原生侧
+// 从未收到过 surface 就绪通知，故必须显式补发一次 surfaceChanged/nativeResize。
+//
+// 这里是同一问题的另一种形态：主窗口复用后，正确尺寸是在 SDL_GL_CreateContext
+// 之后才由 ame_syncReusedWindowSize() 设上的，而 MC 可能在此之前已经查询并
+// 缓存了旧值。指望 SDL_SetWindowSize 自动派发事件并不可靠 ——
+// SDL_SendWindowEvent() 里有 `if (data1 == window->w && data2 == window->h)
+// { ...; return 0; }`，尺寸与 SDL 内部记录一致时事件根本不会产生。
+//
+// 事件类型常量取自 SDL 3.4.0 include/SDL3/SDL_events.h：
+//   SDL_EVENT_WINDOW_SHOWN   = 0x202（= SDL_EVENT_WINDOW_FIRST）
+//   SDL_EVENT_WINDOW_HIDDEN  = 0x203
+//   SDL_EVENT_WINDOW_EXPOSED = 0x204
+//   SDL_EVENT_WINDOW_MOVED   = 0x205
+//   SDL_EVENT_WINDOW_RESIZED = 0x206   ← 只用这一个
+// 0x207 被 sdl2-compat 保留（原 SDL_EVENT_WINDOW_SIZE_CHANGED），
+// PIXEL_SIZE_CHANGED 排在其后、版本间不保证稳定，故不硬编码它：
+// 补 RESIZED 足以让 MC 重新查询，而查询 hook 已统一回报 EGL surface 尺寸。
+#define AME_SDL_EVENT_WINDOW_RESIZED 0x206u
+
+typedef struct ame_SDL_WindowEvent {
+    uint32_t type;
+    uint32_t reserved;
+    uint64_t timestamp;
+    uint32_t windowID;
+    int32_t data1;
+    int32_t data2;
+} ame_SDL_WindowEvent;
+
+typedef union ame_SDL_Event {
+    uint32_t type;
+    ame_SDL_WindowEvent window;
+    uint8_t padding[128];
+} ame_SDL_Event;
+
+typedef bool (*ame_fn_SDL_PushEvent)(void *event);
+typedef uint32_t (*ame_fn_SDL_GetWindowID)(void *window);
+
+static ame_fn_SDL_PushEvent ame_real_PushEvent = NULL;
+static ame_fn_SDL_GetWindowID ame_real_GetWindowID = NULL;
+
+// data1/data2 传 EGL surface 的像素尺寸：查询 hook 回报的同样是像素，
+// 两者一致 —— MC 无论直接取 data 还是重新查询，得到的都是同一个值。
+static bool ame_pushWindowResized(void *window) {
+    if (window == NULL) return false;
+    if (ame_real_PushEvent == NULL) {
+        ame_real_PushEvent =
+            (ame_fn_SDL_PushEvent)ame_real_dlsym("SDL_PushEvent");
+    }
+    if (ame_real_PushEvent == NULL) return false;
+    if (ame_real_GetWindowID == NULL) {
+        ame_real_GetWindowID =
+            (ame_fn_SDL_GetWindowID)ame_real_dlsym("SDL_GetWindowID");
+    }
+
+    int pw = 0, ph = 0;
+    if (!ame_eglSurfacePixelSize(&pw, &ph)) return false;
+
+    ame_SDL_Event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.window.type = AME_SDL_EVENT_WINDOW_RESIZED;
+    ev.window.windowID =
+        (ame_real_GetWindowID != NULL) ? ame_real_GetWindowID(window) : 0u;
+    ev.window.data1 = (int32_t)pw;
+    ev.window.data2 = (int32_t)ph;
+
+    bool pushed = ame_real_PushEvent(&ev);
+    NSDebugLog(@"[SDLHook] posted WINDOW_RESIZED %dx%d px (windowID=%u, %s)",
+               pw, ph, ev.window.windowID, pushed ? "pushed" : "rejected");
+    return pushed;
 }
 
 #pragma mark - 事件窗口解析回落（对齐 ZL2）
@@ -642,6 +763,11 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
                                                    : "no SDL_SetWindowSize"));
     ame_primaryWindowW = targetW;
     ame_primaryWindowH = targetH;
+
+    // 补发一次尺寸事件：MC 可能已在本函数之前查询并缓存了旧值（隐藏工具窗口
+    // 的 320x480），而 SDL_SetWindowSize 在尺寸未变时不产生事件。显式补发
+    // 确保 MC 一定会重新查询，从而拿到 EGL surface 的真实尺寸。
+    ame_pushWindowResized(window);
 }
 
 #pragma mark - 3) EGL 兼容重试
