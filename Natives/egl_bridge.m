@@ -417,7 +417,20 @@ void pojavSwapBuffers() {
     br_swap_buffers();
 }
 
+// pojavCreateContext 在 Vulkan 路径（clientAPI == GLFW_NO_API）下返回的是
+// CAMetalLayer 指针，不是 basic_render_window_t。
+// GLFW 规范规定窗口创建后上下文自动 current，因此 glfwCreateWindow 会紧接着调用
+// glfwMakeContextCurrent(ptr) -> pojavMakeCurrent(ptr)。
+// 若此处不加区分地把 CAMetalLayer 当作 render_window_t 交给 gl_make_current，
+// 后者解引用 bundle->surface / bundle->context 会直接段错误。
+// 用该标志拦住 Vulkan 路径：Vulkan 由 MC/LWJGL 经 libMoltenVK 自管，本就无需 EGL current。
+static BOOL g_pojavContextIsVulkanLayer = NO;
+
 void pojavMakeCurrent(basic_render_window_t* window) {
+    if (g_pojavContextIsVulkanLayer) {
+        NSLog(@"[egl_bridge] pojavMakeCurrent ignored: Vulkan path (CAMetalLayer), no EGL context to make current");
+        return;
+    }
     if (!br_make_current) return;
     br_make_current(window);
 }
@@ -440,6 +453,7 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
         // MC 26.2+ graphicsApi=prefer_vulkan 或 default（Vulkan 路径）会走这里
         // 返回 CAMetalLayer 作为 Vulkan surface，MC/LWJGL 通过 libMoltenVK.dylib 自管 Vulkan
         NSLog(@"[egl_bridge] Vulkan path: returning CAMetalLayer as Vulkan surface");
+        g_pojavContextIsVulkanLayer = YES;
         return (__bridge void *)SurfaceViewController.surface.layer;
     }
 

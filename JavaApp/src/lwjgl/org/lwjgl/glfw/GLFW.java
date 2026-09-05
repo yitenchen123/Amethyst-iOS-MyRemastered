@@ -1014,7 +1014,29 @@ public class GLFW
     public static long glfwCreateWindow(int width, int height, CharSequence title, long monitor, long share) {
         // Create an ACTUAL EGL context
         long ptr = nglfwCreateContext(share);
-        //nativeEglMakeCurrent(ptr);
+        // GLFW 规范：窗口创建后其上下文自动成为 current。
+        // 这行原先被注释掉，于是 GL 路径下没有任何一处 makeCurrent
+        // （gl_init_context 建完 surface/context 直接 return，从不 makeCurrent）。
+        //
+        // 后果：MobileGlues 在 dlopen 的 constructor 里抢占了 current 槽位——它以
+        // EGL_CONTEXT_CLIENT_VERSION=2 + 32x32 pbuffer 调 eglMakeCurrent，成功后
+        // 直接 return 且从不解除（proc_init 的清理被 #ifndef __APPLE__ 排除）。
+        // 于是 MC 调 GL.createCapabilities() 时 current 的是这个 ES 2.0 临时上下文，
+        // glGetIntegerv(GL_MAJOR_VERSION) 在 ES 2.0 下非法 -> GL_INVALID_ENUM，
+        // LWJGL 3.4.x 新增的 EGL/OSMesa/CGL 三段探测在 iOS 上又全部失败：
+        //   - iOS 无系统 EGL；ANGLE 以 framework 形态提供，而 LWJGL 找的是 libEGL.dylib
+        //   - mobileglues 既非系统 EGL 也非 OSMesa
+        // 最终抛 "There is no OpenGL context current in the current thread"。
+        //
+        // 安卓有系统 libEGL.so 兜底、zink 走 OSMesa bridge 命中探测，
+        // 所以只有 iOS + mobileglues 中招。
+        //
+        // 恢复 GLFW 语义，用主上下文覆盖掉残留的 ES 2.0 临时上下文即可。
+        // Vulkan 路径由 egl_bridge 的 g_pojavContextIsVulkanLayer 拦住
+        // （那里返回的是 CAMetalLayer，不是 render_window_t）。
+        if (ptr != 0L && Functions.MakeContextCurrent != 0L) {
+            glfwMakeContextCurrent(ptr);
+        }
         GLFWWindowProperties win = new GLFWWindowProperties();
         // win.width = width;
         // win.height = height;
