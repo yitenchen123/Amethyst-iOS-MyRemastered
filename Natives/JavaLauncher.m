@@ -1198,9 +1198,17 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
     // 故提前到此处（JLI_Launch 之前）以 RTLD_LOCAL 载入：LWJGL 此后的 dlopen 会
     // 命中这份已加载镜像，可见性保持 RTLD_LOCAL，glslang 符号不再进全局空间。
     //
-    // 仅在 SDL3 路径（lwjglVersion == "341"，即 26.3+）启用；GLFW 路径
-    // （1.21.1 / 26.2 走 333）行为完全不变。
-    if ([lwjglVersion isEqualToString:@"341"]) {
+    // 不做 lwjglVersion 筛选，也不区分后端：26.2 与 26.3 同样使用 LWJGL 341
+    // （ResolveLwjglVersion 注释写的是「26.3 起」，实际判定为 major >= 26），
+    // 二者区别只在 26.2 走 GLFW、26.3 走 SDL3。但渲染器都是被 LWJGL 在 JVM 内
+    // bootstrap 阶段 dlopen 的，上述「预载太晚」问题对两条路径同样存在，
+    // 因此这里不按版本或后端分流，一律提前预载。
+    //
+    // 是否真正启用隔离只由下方渲染器排除规则决定：ANGLE 与 Mesa/gallium 需要向
+    // 其它镜像暴露符号，保持 RTLD_GLOBAL 并跳过；其余渲染器（含 MobileGlues、
+    // MobileGL 这类内嵌 glslang 的）走 RTLD_LOCAL。GLFW 老路径因此得到的也是
+    // 同一套语义，不存在「SDL3 才隔离」的分叉。
+    {
         const char *preloadName = getenv("AMETHYST_RENDERER");
         if (preloadName != NULL && strcmp(preloadName, RENDERER_NAME_VULKAN) == 0) {
             // 与上方 opengl.libname 的取值规则保持一致：Vulkan renderer 下
