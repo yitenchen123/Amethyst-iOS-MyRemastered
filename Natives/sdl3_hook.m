@@ -28,11 +28,13 @@
 //   AMETHYST_VULKAN_PTR=<hex>     启用 SDL_LoadObject 句柄共享
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import "utils.h"
 
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>   // strcasecmp
@@ -246,24 +248,100 @@ static bool ame_shouldReusePrimaryWindow(void) {
 // 而 EGL surface 由 SurfaceViewController 的 layer 独立创建（实测 1826x844），
 // 两者对不上 → 画面全黑（输入正常，因为控制层是启动器自己的 view）。
 // 故复用时必须把窗口尺寸同步成当前请求值。
+// 在视图层级中定位 SDL 的 SDL_uikitview。
+// 不走 SDL 属性 API（SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER 的字符串值随版本可能
+// 变动），改为直接遍历层级匹配类名 —— SDL 的视图已被启动器嵌进宿主 view，
+// 一定在同一棵树上，不依赖任何 SDL 符号。
+static UIView *ame_findSDLView(UIView *from) {
+    Class sdlClass = NSClassFromString(@"SDL_uikitview");
+    if (sdlClass == nil || from == nil) return nil;
+
+    UIView *root = from;
+    while (root.superview != nil) root = root.superview;
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count > 0) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:sdlClass]) return v;
+        [stack addObjectsFromArray:v.subviews];
+    }
+    return nil;
+}
+
+// iOS 专有：ZL2 明确注释了"尺寸无需额外处理，由 Android Surface 决定（创建时即
+// 取 Surface 尺寸，与请求值无关）"。iOS 没有这个前提 —— SDL 的 UIKit 后端按
+// 请求值建窗口，于是 RenderPearl 那个隐藏工具窗口就是实打实的 320x480。
+//
+// 主窗口复用后 MC 拿到的仍是 320x480 这个尺寸，会按它设置 viewport / GUI scale，
+// 而 EGL surface 由 SurfaceViewController 的 layer 独立创建，两者对不上 → 黑屏。
+//
+// —— 单位陷阱（曾导致画面缩在左下角）——
+// SDL_SetWindowSize() 收的是 points（屏幕坐标），而 MC 请求的是像素值（启动器
+// 把 physicalSize 传给了它）。早前直接拿请求值调用，75% 分辨率下窗口被设成
+// 1826x844 points，是屏幕逻辑尺寸（812x375）的 2.25 倍；MC 随后按
+// "points x SDL 像素密度(3.0)" 推算 framebuffer，得到远大于实际 EGL surface 的
+// viewport，画面因此只占左下角一角（100% 分辨率时才恰好对上，故看似"能出画面"）。
+//
+// —— 正确做法：对齐 GLFW 路径 ——
+//   窗口 points   = 全屏逻辑尺寸（恒定，与分辨率无关）
+//   像素密度      = 原生 scale x resolutionScale（由启动器配在 layer 上）
+//   于是 drawable = points x 密度 = physicalSize x 缩放 = EGL surface 尺寸
+// 改分辨率时 points 不变、只有 drawable 变，GUI 布局保持稳定，可随意调整。
 static void ame_syncReusedWindowSize(void *window, int w, int h) {
     if (window == NULL || w <= 0 || h <= 0) return;
-    if (w == ame_primaryWindowW && h == ame_primaryWindowH) return;
 
-    bool ok = false;
+    // 取启动器的 GameSurfaceView —— EGL surface 就绑在它的 layer 上
+    UIView *gsv = nil;
+    Class svc = NSClassFromString(@"SurfaceViewController");
+    if (svc != nil && [svc respondsToSelector:NSSelectorFromString(@"surface")]) {
+        id obj = [svc performSelector:NSSelectorFromString(@"surface")];
+        if ([obj isKindOfClass:[UIView class]]) gsv = (UIView *)obj;
+    }
+
+    int targetW = w, targetH = h;
+    CGFloat desiredScale = 0.0;
+    if (gsv != nil && gsv.bounds.size.width > 0.0 && gsv.bounds.size.height > 0.0) {
+        targetW = (int)round(gsv.bounds.size.width);
+        targetH = (int)round(gsv.bounds.size.height);
+        desiredScale = gsv.layer.contentsScale;   // 已含 resolutionScale
+    }
+    if (desiredScale <= 0.0) {
+        // 兜底：由请求像素尺寸与全屏 points 反推缩放比
+        CGSize sp = [UIScreen mainScreen].bounds.size;
+        CGFloat sx = (double)w / MAX(1.0, (double)sp.width);
+        CGFloat sy = (double)h / MAX(1.0, (double)sp.height);
+        CGFloat inferred = MIN(sx, sy);
+        if (inferred > 0.1) desiredScale = inferred;
+    }
+
+    // 同步 SDL 视图的像素密度，使 "points x density" 等于 EGL surface 尺寸
+    UIView *sdlView = ame_findSDLView(gsv);
+    if (sdlView != nil && desiredScale > 0.0 &&
+        fabs((double)sdlView.contentScaleFactor - (double)desiredScale) > 0.001) {
+        CGFloat old = sdlView.contentScaleFactor;
+        sdlView.contentScaleFactor = desiredScale;
+        NSDebugLog(@"[SDLHook] SDL view contentScaleFactor %.3f -> %.3f",
+                   old, desiredScale);
+    }
+
     if (ame_real_SetWindowSize == NULL) {
         ame_real_SetWindowSize =
             (ame_fn_SDL_SetWindowSize)ame_real_dlsym("SDL_SetWindowSize");
     }
+    bool ok = false;
     if (ame_real_SetWindowSize != NULL) {
-        ok = ame_real_SetWindowSize(window, w, h);
+        ok = ame_real_SetWindowSize(window, targetW, targetH);
     }
-    // 即便 SDL 侧拒绝调整，也记录请求值：后续复用比较以此为准，避免每次重复调用。
-    NSDebugLog(@"[SDLHook] reused window resize %dx%d -> %dx%d (%s)",
-               ame_primaryWindowW, ame_primaryWindowH, w, h,
+    NSDebugLog(@"[SDLHook] reused window resize %dx%d -> %dx%d pts @%.3fx "
+               @"(drawable %.0fx%.0f, req px %dx%d) (%s)",
+               ame_primaryWindowW, ame_primaryWindowH, targetW, targetH,
+               desiredScale,
+               (double)targetW * desiredScale, (double)targetH * desiredScale,
+               w, h,
                ok ? "ok" : (ame_real_SetWindowSize ? "rejected" : "no SDL_SetWindowSize"));
-    ame_primaryWindowW = w;
-    ame_primaryWindowH = h;
+    ame_primaryWindowW = targetW;
+    ame_primaryWindowH = targetH;
 }
 
 #pragma mark - 3) EGL 兼容重试
