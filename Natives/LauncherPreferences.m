@@ -248,9 +248,11 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         @{@"key": @ RENDERER_NAME_VULKAN,
           @"name": localize(@"preference.title.renderer.debug.vulkan", nil),
           @"file": @ RENDERER_NAME_VULKAN},
-        @{@"key": @ RENDERER_NAME_MITHRIL,
-          @"name": localize(@"preference.title.renderer.debug.mithril", nil),
-          @"file": @ RENDERER_NAME_MITHRIL},
+        // Mithril (libmithril.dylib) 入口已停用：MobileGL 已可正常工作，
+        // 不再需要维护 Mithril 这条转译路径（其 dylib 需单独预编译）。
+        // @{@"key": @ RENDERER_NAME_MITHRIL,
+        //   @"name": localize(@"preference.title.renderer.debug.mithril", nil),
+        //   @"file": @ RENDERER_NAME_MITHRIL},
         @{@"key": @ RENDERER_NAME_MOBILEGL,
           @"name": localize(@"preference.title.renderer.debug.mobilegl", nil),
           @"file": @ RENDERER_NAME_MOBILEGL},
