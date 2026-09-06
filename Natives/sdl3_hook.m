@@ -352,7 +352,34 @@ static bool ame_screenFallbackPixelSize(int *outW, int *outH) {
 
 // 取 EGL surface 的真实像素尺寸 —— 即 CAMetalLayer.drawableSize，由启动器配成
 // physicalSize x resolutionScale。这是 ANGLE 实际渲染的分辨率。
-static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
+// —— 尺寸缓存：为什么必须有 ——
+// 本函数读取 UIKit 视图层级（UIView -> CALayer -> drawableSize），只能在主线程
+// 调用。而 SDL_GL_SwapWindow 由 Render thread 每帧调用，若在此读取，等于每秒
+// 60 次跨线程访问 UIKit，与主线程布局/呈现竞争 —— 这正是接入 swap 前观测后
+// 开始闪退的原因（同样代码放在 glViewport 里没事，因为那不是每帧路径）。
+//
+// 因此：真实读取只在主线程进行，结果缓存下来；非主线程一律只读缓存，
+// 绝不触碰 UIKit。缓存未建立时用 UIScreen 物理分辨率兜底（读的是屏幕属性，
+// 不是视图层级，且与 drawableSize 至多差 1 像素的取整）。
+#define AME_SURF_CACHE_MAX_AGE 120  // 约 2 秒 @60fps 后允许主线程刷新一次
+
+static int  ame_surfCacheW = 0;
+static int  ame_surfCacheH = 0;
+static bool ame_surfCacheValid = false;
+static int  ame_surfCacheAge = 0;
+
+static void ame_surfCacheInvalidate(void) {
+    ame_surfCacheValid = false;
+    ame_surfCacheAge = 0;
+}
+
+// SDL 窗口的 points 尺寸（建窗后固定）。viewport 判定要用它，但在每帧路径上
+// 反复调用 SDL 去问并不划算，故缓存；窗口尺寸变更时显式置零重取。
+static int ame_sdlPointW = 0;
+static int ame_sdlPointH = 0;
+static void ame_sdlPointCacheInvalidate(void) { ame_sdlPointW = 0; ame_sdlPointH = 0; }
+
+static bool ame_eglSurfacePixelSizeFromUIKit(int *outW, int *outH) {
     if (outW == NULL || outH == NULL) return false;
 
     UIView *gsv = nil;
@@ -391,6 +418,92 @@ static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
         return true;
     }
     return ame_screenFallbackPixelSize(outW, outH);
+}
+
+// —— 从 EGL 本身问尺寸 ——
+// 这是最干净的一路：eglQuerySurface 问的是 surface 对象，不涉及 UIView /
+// CAMetalLayer，因此可以在渲染线程安全调用；而且它返回的正是建 surface 时用的
+// 真实像素尺寸，天然反映启动器的 resolutionScale（100% -> 2436x1124，
+// 75% -> 1827x843），不像 UIScreen 兜底那样恒为全屏分辨率。
+// 有了它，渲染线程再也不必为拿一个尺寸而去读 UIKit。
+#define AME_EGL_DRAW     0x3059
+#define AME_EGL_WIDTH    0x305D
+#define AME_EGL_HEIGHT   0x305E
+
+typedef void *(*ame_fn_eglGetCurrentDisplay)(void);
+typedef void *(*ame_fn_eglGetCurrentSurface)(int readdraw);
+typedef int   (*ame_fn_eglQuerySurface)(void *dpy, void *surf, int attribute, int *value);
+
+static bool ame_surfaceSizeFromEGL(int *outW, int *outH) {
+    void *rh = ame_rendererHandle();
+    if (rh == NULL) return false;
+
+    static ame_fn_eglGetCurrentDisplay  gcd = NULL;
+    static ame_fn_eglGetCurrentSurface  gcs = NULL;
+    static ame_fn_eglQuerySurface       qs  = NULL;
+    static bool resolved = false;
+    if (!resolved) {
+        resolved = true;
+        gcd = (ame_fn_eglGetCurrentDisplay)dlsym(rh, "eglGetCurrentDisplay");
+        gcs = (ame_fn_eglGetCurrentSurface)dlsym(rh, "eglGetCurrentSurface");
+        qs  = (ame_fn_eglQuerySurface)dlsym(rh, "eglQuerySurface");
+    }
+    if (gcd == NULL || gcs == NULL || qs == NULL) return false;
+
+    void *dpy = gcd();
+    void *surf = gcs(AME_EGL_DRAW);
+    if (dpy == NULL || surf == NULL) return false;
+
+    int w = 0, h = 0;
+    if (qs(dpy, surf, AME_EGL_WIDTH, &w) && qs(dpy, surf, AME_EGL_HEIGHT, &h) &&
+        w > 0 && h > 0) {
+        *outW = w;
+        *outH = h;
+        return true;
+    }
+    return false;
+}
+
+// 对外仍是 ame_eglSurfacePixelSize：全部调用点自动获得缓存语义，无需逐个改动。
+static bool ame_eglSurfacePixelSize(int *outW, int *outH) {
+    if (outW == NULL || outH == NULL) return false;
+
+    // 首选 EGL 查询：线程安全、且反映 resolutionScale。拿不到再退回 UIKit 缓存。
+    if (ame_surfaceSizeFromEGL(outW, outH)) return true;
+
+    bool onMain = [NSThread isMainThread];
+
+    if (ame_surfCacheValid) {
+        // 非主线程：只读缓存，绝不触碰 UIKit。
+        if (!onMain) {
+            *outW = ame_surfCacheW;
+            *outH = ame_surfCacheH;
+            return true;
+        }
+        if (ame_surfCacheAge < AME_SURF_CACHE_MAX_AGE) {
+            ame_surfCacheAge++;
+            *outW = ame_surfCacheW;
+            *outH = ame_surfCacheH;
+            return true;
+        }
+    }
+
+    if (!onMain) {
+        // 缓存尚未建立又在渲染线程：用屏幕物理分辨率兜底，不读视图层级。
+        return ame_screenFallbackPixelSize(outW, outH);
+    }
+
+    int w = 0, h = 0;
+    if (ame_eglSurfacePixelSizeFromUIKit(&w, &h) && w > 0 && h > 0) {
+        ame_surfCacheW = w;
+        ame_surfCacheH = h;
+        ame_surfCacheValid = true;
+        ame_surfCacheAge = 0;
+        *outW = w;
+        *outH = h;
+        return true;
+    }
+    return false;
 }
 
 // —— 窗口尺寸(points 语义)也必须回报 EGL surface 的像素尺寸 ——
@@ -788,6 +901,10 @@ static void ame_syncReusedWindowSize(void *window, int w, int h, bool pushEvent)
     if (ame_real_SetWindowSize != NULL) {
         ok = ame_real_SetWindowSize(window, targetW, targetH);
     }
+    // 窗口尺寸已变：SDL 内部的 points 与已缓存的 EGL surface 尺寸都可能过期，
+    // 令其失效，下次查询重新取值（否则 75%/100% 切换后会沿用旧的 surface 尺寸）。
+    ame_sdlPointCacheInvalidate();
+    ame_surfCacheInvalidate();
 
     // SetWindowSize 之后 SDL 会按自身换算调整视图；这里把视图强制回全屏逻辑尺寸，
     // 使显示铺满屏幕（真正的渲染尺寸由 EGL surface 决定，与此处无关）。
@@ -983,11 +1100,20 @@ static bool ame_viewportIsBad(int32_t width, int32_t height,
         *why = "hidden utility window size";
         return true;
     }
-    // 候选二：MC 把 SDL 内部的 points 当成了像素
-    int sdlW = 0, sdlH = 0;
-    if (ame_primaryWindow != NULL && ame_real_GetWindowSize != NULL &&
-        ame_real_GetWindowSize(ame_primaryWindow, &sdlW, &sdlH) &&
-        sdlW > 0 && sdlH > 0 && width == sdlW && height == sdlH) {
+    // 候选二：MC 把 SDL 内部的 points 当成了像素。
+    // points 在建窗后即固定，缓存一次足够，免得在每帧路径上反复调用 SDL。
+    // 窗口尺寸变更时由 ame_sdlPointCacheInvalidate 置零重取。
+    if (ame_sdlPointW <= 0 || ame_sdlPointH <= 0) {
+        int pw = 0, ph = 0;
+        if (ame_primaryWindow != NULL && ame_real_GetWindowSize != NULL &&
+            ame_real_GetWindowSize(ame_primaryWindow, &pw, &ph) &&
+            pw > 0 && ph > 0) {
+            ame_sdlPointW = pw;
+            ame_sdlPointH = ph;
+        }
+    }
+    if (ame_sdlPointW > 0 && ame_sdlPointH > 0 &&
+        width == ame_sdlPointW && height == ame_sdlPointH) {
         *why = "SDL window points used as pixels";
         return true;
     }
@@ -1007,11 +1133,38 @@ static bool ame_viewportIsBad(int32_t width, int32_t height,
 // 那时 ame_real_glViewport 仍是 NULL，需自行 dlsym。
 // 渲染器以 RTLD_LOCAL 加载，故 dlsym(RTLD_DEFAULT) 可能取不到，
 // 必须优先从渲染器句柄取。
+// —— 校验 GL 入口点确实来自渲染器本身 ——
+// 渲染器以 RTLD_LOCAL 载入，dlsym(RTLD_DEFAULT) 取不到它，退而拿到的便是
+// 系统 OpenGLES.framework 的桩实现（诊断日志已坐实：
+//   dlsym(RTLD_DEFAULT,"glGetString")
+//     -> /System/Library/Frameworks/OpenGLES.framework/OpenGLES
+//   glGetString(GL_VERSION)=(NULL)   glGetIntegerv(GL_MAJOR_VERSION)=-1 ）。
+// 那份实现与我们的 EGL/ANGLE 上下文毫无关系：它既没有 current context，
+// 其 glViewport 也不会作用于我们的 framebuffer。后果是双重的 ——
+//   1) 拿它去纠正 viewport 完全无效，画面依旧缩在角落（小窗不消失的真正原因）；
+//   2) 在渲染线程执行与上下文不匹配的实现，是闪退的直接来源。
+// 因此凡是要真正执行的 GL 入口点，都用 dladdr 验明镜像，拒绝系统框架的桩。
+static bool ame_glSymbolTrusted(const void *sym) {
+    if (sym == NULL) return false;
+    Dl_info info;
+    if (dladdr(sym, &info) == 0 || info.dli_fname == NULL) return false;
+    const char *img = info.dli_fname;
+    return (strstr(img, "OpenGLES.framework") == NULL &&
+            strstr(img, "OpenGL.framework") == NULL);
+}
+
 static ame_fn_glViewport ame_resolve_glViewport(void) {
-    if (ame_real_glViewport != NULL) return ame_real_glViewport;
+    // 若已缓存的是系统桩（例如被 dlsym 路径的 RTLD_DEFAULT 回退污染），丢弃重解析。
+    if (ame_real_glViewport != NULL &&
+        ame_glSymbolTrusted((const void *)ame_real_glViewport)) {
+        return ame_real_glViewport;
+    }
+    ame_real_glViewport = NULL;
     void *rh = ame_rendererHandle();
-    if (rh != NULL)
-        ame_real_glViewport = (ame_fn_glViewport)dlsym(rh, "glViewport");
+    if (rh != NULL) {
+        void *p = dlsym(rh, "glViewport");
+        if (ame_glSymbolTrusted(p)) ame_real_glViewport = (ame_fn_glViewport)p;
+    }
     // 刻意不回退 dlsym(RTLD_DEFAULT)：渲染器以 RTLD_LOCAL 载入时，全局符号表里
     // 的 glViewport 可能来自别的 GL 实现（系统 GLES / EAGL / 被 GLOBAL 加载的
     // ANGLE）。那与当前 EGL 上下文不匹配，一经调用即崩 —— 这正是本文件在
@@ -1027,8 +1180,10 @@ static ame_fn_glViewport ame_resolve_glViewport(void) {
 static void ame_maybeWrapGl(const char *name, void **out) {
     if (name == NULL || out == NULL || *out == NULL) return;
     if (strcmp(name, "glViewport") != 0) return;
-    if (ame_real_glViewport == NULL) ame_real_glViewport = (ame_fn_glViewport)*out;
-    *out = (void *)ame_glViewport;
+    if (ame_real_glViewport == NULL && ame_glSymbolTrusted(*out))
+        ame_real_glViewport = (ame_fn_glViewport)*out;
+    // 仅在真实指针可信时才换上包装；否则原样放行，绝不包装一份系统桩。
+    if (ame_real_glViewport != NULL) *out = (void *)ame_glViewport;
 }
 
 // 把原始指针换成代理。orig 为 NULL 时不覆盖（ZL2 语义：首次解析后固定）。
@@ -1426,7 +1581,9 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
 // 渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
     if (ame_real_glViewport == NULL) {
-        return;
+        // 接管时可能还没拿到渲染器句柄，这里再解析一次。
+        (void)ame_resolve_glViewport();
+        if (ame_real_glViewport == NULL) return;  // 仍拿不到则不接管，安全放行
     }
 
     int eglW = 0, eglH = 0;
@@ -1510,13 +1667,20 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     // 也可能直接 dlsym 取 GL 入口。这里双保险，确保两条路都拿到包装版本。
     // 拿不到真实指针时返回 NULL（= 不接管），由调用方回落原始 dlsym 结果。
     if (strcmp(name, "glViewport") == 0) {
-        if (ame_real_glViewport == NULL) {
-            ame_real_glViewport =
-                (ame_fn_glViewport)amethyst_orig_dlsym(handle, name);
-            if (ame_real_glViewport == NULL)
-                ame_real_glViewport =
-                    (ame_fn_glViewport)amethyst_orig_dlsym(RTLD_DEFAULT, name);
+        // 只认渲染器镜像里的实现。绝不回退 RTLD_DEFAULT：渲染器是 RTLD_LOCAL，
+        // 全局表里那一份属于系统 OpenGLES 框架，拿它纠正 viewport 无效且会崩。
+        if (ame_real_glViewport == NULL ||
+            !ame_glSymbolTrusted((const void *)ame_real_glViewport)) {
+            ame_real_glViewport = NULL;
+            void *rh = ame_rendererHandle();
+            if (rh != NULL) {
+                void *p = dlsym(rh, name);
+                if (ame_glSymbolTrusted(p))
+                    ame_real_glViewport = (ame_fn_glViewport)p;
+            }
         }
+        // 拿不到可信实现就不接管：宁可让 MC 用它原本会拿到的指针，
+        // 也不包装一份一调用就崩的桩。
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
         return NULL;
     }
