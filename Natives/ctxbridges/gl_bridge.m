@@ -402,6 +402,70 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     return bundle;
 }
 
+// ===== 诊断探针：复现 LWJGL 3.4.1 GL.createCapabilities() 的取值路径 =====
+//
+// LWJGL 3.4.1 源码（GL.java:427-456，本仓库 lwjgl-lib/3.4.1-lwgjl 可查）：
+//   GetError    = functionProvider.getFunctionAddress("glGetError");
+//   GetString   = functionProvider.getFunctionAddress("glGetString");
+//   GetIntegerv = functionProvider.getFunctionAddress("glGetIntegerv");
+//   callPV(GL_MAJOR_VERSION, ..., GetIntegerv);
+//   if (callI(GetError) == GL_NO_ERROR && 3 <= majorVersion) { /* 3.0+ 分支 */ }
+//   else {
+//       versionString = glGetString(GL_VERSION);
+//       if (versionString == null || callI(GetError) != GL_NO_ERROR)
+//           throw new IllegalStateException("There is no OpenGL context current...");
+//   }
+//
+// GLFW 库句柄构造为 MacOSXLibraryDL("AngelAuraAmethyst", RTLD_DEFAULT)，
+// 即 LWJGL 的 GL 入口点来自 dlsym(RTLD_DEFAULT, ...) 全局查找，
+// 与 EGL 侧 eglMakeCurrent 用的是哪一份实现无关。
+// 因此这里同样用 RTLD_DEFAULT 取值，才能反映 LWJGL 真正拿到的是谁的实现。
+//
+// 只打印前 3 次，避免日志刷屏。
+static void ame_diagGlEntryPoints(void) {
+    static int s_diagCount = 0;
+    if (s_diagCount >= 3) { return; }
+    s_diagCount++;
+
+    enum { AME_GL_VERSION = 0x1F02, AME_GL_MAJOR_VERSION = 0x821B };
+    typedef unsigned int ame_gl_enum_t;
+    typedef int ame_gl_int_t;
+    typedef const unsigned char *(*ame_glGetString_t)(ame_gl_enum_t);
+    typedef void (*ame_glGetIntegerv_t)(ame_gl_enum_t, ame_gl_int_t *);
+    typedef ame_gl_enum_t (*ame_glGetError_t)(void);
+
+    void *curCtx = handle.eglGetCurrentContext ? handle.eglGetCurrentContext() : NULL;
+    NSLog(@"[gl_bridge][diag] #%d eglGetCurrentContext=%p display=%p",
+          s_diagCount, curCtx, g_EglDisplay);
+
+    void *symGetString = dlsym(RTLD_DEFAULT, "glGetString");
+    Dl_info dli;
+    const char *image = "<unknown>";
+    if (symGetString != NULL && dladdr(symGetString, &dli) != 0 && dli.dli_fname != NULL) {
+        image = dli.dli_fname;
+    }
+    NSLog(@"[gl_bridge][diag] #%d dlsym(RTLD_DEFAULT,\"glGetString\")=%p image=%s",
+          s_diagCount, symGetString, image);
+
+    if (symGetString != NULL) {
+        const unsigned char *version = ((ame_glGetString_t)symGetString)(AME_GL_VERSION);
+        NSLog(@"[gl_bridge][diag] #%d glGetString(GL_VERSION)=%s",
+              s_diagCount, version != NULL ? (const char *)version : "(NULL)");
+    }
+
+    void *symGetIntegerv = dlsym(RTLD_DEFAULT, "glGetIntegerv");
+    void *symGetError = dlsym(RTLD_DEFAULT, "glGetError");
+    if (symGetIntegerv != NULL && symGetError != NULL) {
+        ((ame_glGetError_t)symGetError)();
+        ame_gl_int_t major = -1;
+        ((ame_glGetIntegerv_t)symGetIntegerv)(AME_GL_MAJOR_VERSION, &major);
+        ame_gl_enum_t err = ((ame_glGetError_t)symGetError)();
+        NSLog(@"[gl_bridge][diag] #%d glGetIntegerv(GL_MAJOR_VERSION)=%d glGetError=0x%x",
+              s_diagCount, major, (unsigned)err);
+    }
+}
+// ===== 诊断探针结束 =====
+
 void gl_make_current(gl_render_window_t* bundle) {
     if(!bundle) {
         if(handle.eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT)) {
@@ -440,6 +504,7 @@ void gl_make_current(gl_render_window_t* bundle) {
                 NSLog(@"[gl_bridge] eglSwapInterval(0) set immediately after eglMakeCurrent (POJAV_DISABLE_VSYNC=1, renderer=%s)", getenv("AMETHYST_RENDERER") ?: "<unset>");
             }
         }
+        ame_diagGlEntryPoints();
     } else {
         NSLog(@"EGLBridge: eglMakeCurrent returned with error: 0x%x", handle.eglGetError());
     }
