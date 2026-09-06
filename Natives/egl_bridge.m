@@ -500,21 +500,33 @@ static void pojavEnforceViewportAtSwap(void) {
 
     typedef void (*fn_getiv_t)(uint32_t, int32_t *);
     typedef void (*fn_vp_t)(int32_t, int32_t, int32_t, int32_t);
+    // 先看当前绑定的 framebuffer。这是判定能否安全纠正的依据：
+    // 只有渲染目标是默认 framebuffer(0) 时，viewport 才「必须」等于 EGL surface
+    // 尺寸；若绑定的是 FBO，小 viewport 属于合法的离屏/后处理渲染，纠正会破坏它。
+    int32_t fb = -1;
+    ((fn_getiv_t)fnGetIv)(0x8CA6 /* GL_FRAMEBUFFER_BINDING */, &fb);
+
     int32_t v[4] = {0, 0, 0, 0};
     ((fn_getiv_t)fnGetIv)(0x0BA2 /* GL_VIEWPORT */, v);
     int32_t vw = v[2], vh = v[3];
 
-    if (vw == eglW && vh == eglH) return;
+    int matches = (vw == eglW && vh == eglH);
 
-    int bad = ((vw == 320 && vh == 480) || (vw == 812 && vh == 375));
-    if (!bad) return;
-
+    // 无条件记录：无论正确、已纠正、还是因绑定 FBO 而跳过，都必须留痕。
+    // 若少了这一档，viewport 是第三种值时代码会静默返回，一轮实测下来仍然
+    // 一无所知 —— 那正是此前反复空转的成因。
     if (logBudget > 0) {
         logBudget--;
-        NSLog(@"[egl_bridge] viewport guard: %dx%d -> %dx%d (EGL surface)",
-              vw, vh, eglW, eglH);
+        const char *verdict = matches ? "ok"
+                            : (fb == 0 ? "MISMATCH->corrected" : "MISMATCH-fbo-bound,skipped");
+        NSLog(@"[egl_bridge] viewport guard: vp=%dx%d egl=%dx%d fb=%d %s (glViewport=%p)",
+              vw, vh, eglW, eglH, fb, verdict, fnViewport);
     }
+
+    if (matches) return;
+    if (fb != 0) return;   // 离屏渲染，不干预
     if (fnViewport == NULL) return;
+
     ((fn_vp_t)fnViewport)(0, 0, (int32_t)eglW, (int32_t)eglH);
 }
 
