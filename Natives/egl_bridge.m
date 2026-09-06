@@ -399,7 +399,129 @@ void pojavSetWindowHint(int hint, int value) {
     }
 }
 
+
+// —— 取 EGL surface 的像素尺寸 ——
+// 与 sdl3_hook 的 ame_eglSurfacePixelSize 同逻辑：优先 CAMetalLayer.drawableSize
+// （gl_bridge 建 surface 用的就是它），回落 bounds x contentsScale，再回落主屏。
+static bool pojavEglSurfacePixelSize(int *outW, int *outH) {
+    if (outW == NULL || outH == NULL) return false;
+    *outW = 0; *outH = 0;
+
+    UIView *gsv = nil;
+    Class svc = NSClassFromString(@"SurfaceViewController");
+    if (svc != nil && [svc respondsToSelector:NSSelectorFromString(@"surface")]) {
+        id obj = [svc performSelector:NSSelectorFromString(@"surface")];
+        if ([obj isKindOfClass:[UIView class]]) gsv = (UIView *)obj;
+    }
+    if (gsv == nil) return false;
+    CALayer *layer = gsv.layer;
+    if (layer == nil) return false;
+
+    SEL sel = NSSelectorFromString(@"drawableSize");
+    if ([layer respondsToSelector:sel]) {
+        NSMethodSignature *sig = [layer methodSignatureForSelector:sel];
+        if (sig != nil && strcmp([sig methodReturnType], @encode(CGSize)) == 0) {
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.selector = sel;
+            [inv invokeWithTarget:layer];
+            CGSize size = CGSizeZero;
+            [inv getReturnValue:&size];
+            if (size.width > 1.0 && size.height > 1.0) {
+                *outW = (int)round(size.width);
+                *outH = (int)round(size.height);
+                return true;
+            }
+        }
+    }
+    CGFloat scale = layer.contentsScale;
+    CGSize bs = layer.bounds.size;
+    if (scale > 0.0 && bs.width > 1.0 && bs.height > 1.0) {
+        *outW = (int)round(bs.width * scale);
+        *outH = (int)round(bs.height * scale);
+        return true;
+    }
+    UIScreen *screen = [UIScreen mainScreen];
+    CGSize sb = screen.bounds.size;
+    CGFloat sc = screen.scale;
+    if (sb.width > 0.0 && sb.height > 0.0 && sc > 0.0) {
+        *outW = (int)round(sb.width * sc);
+        *outH = (int)round(sb.height * sc);
+        return true;
+    }
+    return false;
+}
+
+// —— swap 前强制 viewport 对齐 EGL surface ——
+//
+// 根因（日志与代码双向确认）：26.3 的 RenderPearl 先建一个隐藏工具窗口
+// （320x480）并在其上建 GL context，初始 viewport 即被设为 320x480；主窗口随后
+// 复用同一个 window 指针，MC 查询得到的是 EGL surface 的真实尺寸 —— 与它期望的
+// 完全一致，于是不触发任何 resize 逻辑，viewport 从此再无重设机会，画面永久缩在
+// 320x480 的一角。手动改一次分辨率能恢复，正因为那才真正触发了一次重设。
+//
+// 修正点选在 pojavSwapBuffers：GL 路径每一帧都必须经此交换缓冲；Vulkan 走
+// MoltenVK 的 vkQueuePresentKHR，根本不进入本函数（见本文件上方注释），故天然
+// 不受影响。这是唯一不依赖 MC 究竟调用 SDL_GL_SwapWindow 还是别的入口、必定
+// 命中的落地点 —— 此前把兜底挂在 ame_SDL_GL_SwapWindow 上，日志零输出已证明
+// MC 并未走那条路。
+//
+// GL 函数指针优先经 eglGetProcAddress 取得：渲染器多为 RTLD_LOCAL 加载（隔离
+// glslang 符号所需），dlsym(RTLD_DEFAULT) 取不到，而 eglGetProcAddress 由当前
+// EGL context 提供，不受库可见性影响。
+//
+// 判定保守：只精确匹配已知错误候选（隐藏工具窗口 320x480、SDL points 812x375），
+// 不做比例推断。swap 当下渲染目标恒为主 framebuffer，其 viewport 本就应等于 EGL
+// surface；渲染到 FBO 的小 viewport 不会在 swap 这一刻生效，故不会误伤。
+static void pojavEnforceViewportAtSwap(void) {
+    static void *fnGetIv = NULL;
+    static void *fnViewport = NULL;
+    static int resolved = 0;
+    static int logBudget = 8;
+
+    if (!resolved) {
+        resolved = 1;
+        fnGetIv = dlsym(RTLD_DEFAULT, "glGetIntegerv");
+        fnViewport = dlsym(RTLD_DEFAULT, "glViewport");
+        void *eglGPA = dlsym(RTLD_DEFAULT, "eglGetProcAddress");
+        if (eglGPA != NULL) {
+            typedef void *(*fn_gpa_t)(const char *);
+            fn_gpa_t gpa = (fn_gpa_t)eglGPA;
+            if (fnGetIv == NULL) fnGetIv = gpa("glGetIntegerv");
+            if (fnViewport == NULL) fnViewport = gpa("glViewport");
+        }
+        NSLog(@"[egl_bridge] viewport guard: glGetIntegerv=%p glViewport=%p",
+              fnGetIv, fnViewport);
+    }
+    if (fnGetIv == NULL) return;
+
+    int eglW = 0, eglH = 0;
+    if (!pojavEglSurfacePixelSize(&eglW, &eglH)) return;
+    if (eglW <= 0 || eglH <= 0) return;
+
+    typedef void (*fn_getiv_t)(uint32_t, int32_t *);
+    typedef void (*fn_vp_t)(int32_t, int32_t, int32_t, int32_t);
+    int32_t v[4] = {0, 0, 0, 0};
+    ((fn_getiv_t)fnGetIv)(0x0BA2 /* GL_VIEWPORT */, v);
+    int32_t vw = v[2], vh = v[3];
+
+    if (vw == eglW && vh == eglH) return;
+
+    int bad = ((vw == 320 && vh == 480) || (vw == 812 && vh == 375));
+    if (!bad) return;
+
+    if (logBudget > 0) {
+        logBudget--;
+        NSLog(@"[egl_bridge] viewport guard: %dx%d -> %dx%d (EGL surface)",
+              vw, vh, eglW, eglH);
+    }
+    if (fnViewport == NULL) return;
+    ((fn_vp_t)fnViewport)(0, 0, (int32_t)eglW, (int32_t)eglH);
+}
+
 void pojavSwapBuffers() {
+    // viewport 守护：GL 路径每帧必经此处，Vulkan 不经（见函数上方注释）
+    pojavEnforceViewportAtSwap();
+
     // FPS 计数（参照 FCL/ZL2 在 native swap buffer 入口计数，反映真实渲染帧率）
     atomic_fetch_add(&_pojavFpsCounter, 1);
 
