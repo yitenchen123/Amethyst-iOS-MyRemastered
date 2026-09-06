@@ -91,6 +91,12 @@ typedef void *(*ame_fn_SDL_GL_GetCurrentContext)(void);
 // 尺寸查询（见 ame_SDL_GetWindowSizeInPixels 处的说明）
 typedef bool (*ame_fn_SDL_GetWindowSizeInPixels)(void *window, int *w, int *h);
 typedef bool (*ame_fn_SDL_GL_GetDrawableSize)(void *window, int *w, int *h);
+// 像素密度：MC 用它把我们从 SDL_GetWindowSizeInPixels 回报的像素换算成
+// 「逻辑尺寸」，再拿逻辑尺寸去设 viewport —— 于是 2436x1125 / 3.0 =
+// 812x375，画面缩在左上角。ZL2/FCL/GLFW 路径下 points 恒等于 pixels
+// （scale 事实上为 1），故从不出这个偏差。这里对齐它们。
+typedef float (*ame_fn_SDL_GetWindowDisplayScale)(void *window);
+typedef float (*ame_fn_SDL_GetDisplayContentScale)(uint32_t displayID);
 
 // 事件窗口解析回落（见 ame_SDL_GetWindowFromEvent 处的说明）
 typedef void *(*ame_fn_SDL_GetWindowFromEvent)(const void *event);
@@ -132,6 +138,9 @@ static ame_fn_SDL_GL_DestroyContext ame_real_GL_DestroyContext = NULL;
 static ame_fn_SDL_GL_GetCurrentContext ame_real_GL_GetCurrentContext = NULL;
 static ame_fn_SDL_GetWindowSizeInPixels ame_real_GetWindowSizeInPixels = NULL;
 static ame_fn_SDL_GL_GetDrawableSize ame_real_GL_GetDrawableSize = NULL;
+static ame_fn_SDL_GetWindowDisplayScale ame_real_GetWindowDisplayScale = NULL;
+static ame_fn_SDL_GetDisplayContentScale ame_real_GetDisplayContentScale = NULL;
+static int ame_scaleOverrideLogBudget = 4;
 
 static ame_fn_SDL_GetWindowFromEvent ame_real_GetWindowFromEvent = NULL;
 static ame_fn_SDL_GetWindowFromID ame_real_GetWindowFromID = NULL;
@@ -605,6 +614,37 @@ static bool ame_SDL_GetWindowSizeInPixels(void *window, int *w, int *h) {
         return ame_real_GetWindowSizeInPixels(window, w, h);
     }
     return false;
+}
+
+// —— 像素密度必须回报 1.0：小窗的根因修复 ——
+//
+// 日志算术坐实了机制（26.3 + MobileGL 实测）：
+//     EGL surface（我们回报的像素）  = 2436 x 1125
+//     MC 实际设置的 viewport        =  812 x  375
+//     2436/812 = 3.0     1125/375 = 3.0
+// 即 MC 把像素尺寸除以设备 scale(3.0) 得到「逻辑尺寸」，再用逻辑尺寸设
+// viewport —— 这正是「points 被当成像素」。此前所有补丁都试图在出口处把
+// 812x375 改写回去，但改写发生在 swap（绘制之后），永远晚一帧，故无效。
+//
+// 根因是 SDL 的 uikit 后端把 scale 固定为 UIScreen.nativeScale：
+//     UIKit_GetWindowSizeInPixels():  scale = screen.nativeScale (3.0)
+// 而 GLFW 路径下 glfwGetWindowSize() 与 glfwGetFramebufferSize() 取同一个
+// 字段，points 与 pixels 恒等；Android(ZL2/FCL) 后端同样如此。这三条路径
+// 因此都不会出现换算偏差 —— 这就是它们没有小窗的原因。
+//
+// 修法是把 scale 对齐为 1.0，让 points == pixels，与上述三条路径一致。
+// 渲染分辨率不受影响：画面始终绘制进 EGL surface(2436x1125)，scale 只参与
+// MC 侧的换算。输入坐标由启动器按物理像素注入，不经 SDL 换算，亦不受影响。
+static float ame_SDL_GetWindowDisplayScale(void *window) {
+    if (ame_scaleOverrideLogBudget > 0) {
+        ame_scaleOverrideLogBudget--;
+        NSDebugLog(@"[SDLHook] GetWindowDisplayScale -> 1.00 (forced; points == pixels)");
+    }
+    return 1.0f;
+}
+
+static float ame_SDL_GetDisplayContentScale(uint32_t displayID) {
+    return 1.0f;
 }
 
 static bool ame_SDL_GL_GetDrawableSize(void *window, int *w, int *h) {
@@ -1201,7 +1241,7 @@ typedef void (*ame_fn_glViewport)(int32_t x, int32_t y,
                                   int32_t width, int32_t height);
 
 static ame_fn_glViewport ame_real_glViewport = NULL;
-static int ame_glViewportLogBudget = 8;
+static int ame_glViewportLogBudget = 24;
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height);
 
 // 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
@@ -1622,10 +1662,23 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
 // 判定刻意保守 —— 只精确匹配「已知的错误候选」，不做比例推断，以免误伤
 // 渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
+    // 无条件记录入口参数，且必须早于任何提前返回：此前日志放在「解析到真实
+    // 实现」之后，于是「拿不到实现而被静默丢弃」的情况一个字都不留，无法区分
+    // 是 MC 没调用、还是调用被悄悄丢掉了。
+    if (ame_glViewportLogBudget > 0) {
+        ame_glViewportLogBudget--;
+        NSDebugLog(@"[SDLHook] glViewport in %dx%d (x=%d y=%d)", width, height, x, y);
+    }
     if (ame_real_glViewport == NULL) {
         // 接管时可能还没拿到渲染器句柄，这里再解析一次。
         (void)ame_resolve_glViewport();
-        if (ame_real_glViewport == NULL) return;  // 仍拿不到则不接管，安全放行
+        if (ame_real_glViewport == NULL) {
+            if (ame_glViewportLogBudget > 0) {
+                ame_glViewportLogBudget--;
+                NSDebugLog(@"[SDLHook] glViewport DROPPED: no trusted impl");
+            }
+            return;  // 仍拿不到则不接管，安全放行
+        }
     }
 
     int eglW = 0, eglH = 0;
@@ -1966,6 +2019,18 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
                 ame_real_GL_GetDrawableSize = (ame_fn_SDL_GL_GetDrawableSize)amethyst_orig_dlsym(handle, name);
             NSDebugLog(@"[SDLHook] hooked SDL_GL_GetDrawableSize -> EGL surface size");
             return (void *)ame_SDL_GL_GetDrawableSize;
+        }
+        if (strcmp(name, "SDL_GetWindowDisplayScale") == 0) {
+            if (ame_real_GetWindowDisplayScale == NULL)
+                ame_real_GetWindowDisplayScale = (ame_fn_SDL_GetWindowDisplayScale)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetWindowDisplayScale -> 1.0 (points == pixels)");
+            return (void *)ame_SDL_GetWindowDisplayScale;
+        }
+        if (strcmp(name, "SDL_GetDisplayContentScale") == 0) {
+            if (ame_real_GetDisplayContentScale == NULL)
+                ame_real_GetDisplayContentScale = (ame_fn_SDL_GetDisplayContentScale)amethyst_orig_dlsym(handle, name);
+            NSDebugLog(@"[SDLHook] hooked SDL_GetDisplayContentScale -> 1.0 (points == pixels)");
+            return (void *)ame_SDL_GetDisplayContentScale;
         }
     }
 
