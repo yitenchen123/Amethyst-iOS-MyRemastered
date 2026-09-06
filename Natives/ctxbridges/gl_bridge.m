@@ -53,9 +53,32 @@ static bool dlsym_EGL() {
     //
     // ANGLE 作为多个渲染器共享的 EGL host 仍保持 RTLD_GLOBAL，行为不变。
     // 逃生开关：AMETHYST_MOBILEGL_RTLD_GLOBAL=1 可恢复旧行为，无需重新构建。
+    // MobileGlues（26.2/26.3 + LWJGL 3.4.1）同样必须 RTLD_LOCAL：
+    //
+    // libtinygl4angle.dylib 由 gl4es 的 tinygl4angle.c 构建，镜像内带有 GL 入口点
+    // （glGetString / glGetError / glGetIntegerv 等）。以 RTLD_GLOBAL 载入时这些
+    // 入口点进入全局符号空间，并在 iOS flat namespace 下抢占
+    // libGLESv2.framework / libmobileglues.dylib 提供的同名符号。
+    //
+    // LWJGL 3.4.1 的 GL.createCapabilities() 会 dlsym 解析 glGetError /
+    // glGetString / glGetIntegerv。若命中 tinygl4angle 这份没有 GL 上下文的副本，
+    // glGetString(GL_VERSION) 返回 NULL、glGetError() 返回非零，于是
+    // GL.java:456 抛出 "There is no OpenGL context current in the current thread."。
+    //
+    // 反证：MobileGlues 自身的 glGetError() 恒返回 GL_NO_ERROR，
+    // glGetString(GL_VERSION) 恒返回非空（由全局 GLVersion 拼装），
+    // 因此只要 LWJGL 解析到的是 MobileGlues 的入口点，该异常在逻辑上不可能发生。
+    //
+    // 改为 RTLD_LOCAL 后全局空间只剩 MobileGlues 自己以 RTLD_GLOBAL 载入的
+    // libGLESv2.framework，LWJGL 解析到的即为渲染器真实入口点。
+    // 逃生开关：AMETHYST_ANGLE_RTLD_GLOBAL=1 可恢复旧行为，无需重新构建。
     const char *forceGlobal = getenv("AMETHYST_MOBILEGL_RTLD_GLOBAL");
-    bool useLocalEGL = isMobileGLRenderer(renderer) &&
-                       !(forceGlobal && forceGlobal[0] == '1');
+    bool isMobileGlues = renderer && !strcmp(renderer, RENDERER_NAME_MOBILEGLUES);
+    const char *forceAngleGlobal = getenv("AMETHYST_ANGLE_RTLD_GLOBAL");
+    bool useLocalEGL = (isMobileGLRenderer(renderer) &&
+                        !(forceGlobal && forceGlobal[0] == '1')) ||
+                       (isMobileGlues &&
+                        !(forceAngleGlobal && forceAngleGlobal[0] == '1'));
     int eglDlFlags = RTLD_NOW | (useLocalEGL ? RTLD_LOCAL : RTLD_GLOBAL);
     void* dl_handle = dlopen(eglPath.UTF8String, eglDlFlags);
     if (!dl_handle) {
