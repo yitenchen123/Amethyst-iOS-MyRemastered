@@ -560,6 +560,64 @@ void pojavSwapBuffers() {
 // 用该标志拦住 Vulkan 路径：Vulkan 由 MC/LWJGL 经 libMoltenVK 自管，本就无需 EGL current。
 static BOOL g_pojavContextIsVulkanLayer = NO;
 
+/// 清空当前上下文遗留的 GL 错误码。
+///
+/// 因果链（26.3 + MobileGlues 实测日志）：
+///   MobileGlues 的 constructor 在 JVM 启动前建临时 ES3 pbuffer 并 makeCurrent，
+///   随后 init_target_gles() 与 multidraw 能力探测在该临时上下文上执行并留下
+///   错误码（日志中 "EGL initialized successfully (temp context ES 3)" 与
+///   "Not Detected GL_EXT_multi_draw_indirect!" 正是这段）。
+///   MC 26.3 的 RenderPearl 在 GlBackend.loadLibrary() 里直接调 glGetError()
+///   判定上下文可用性，且不预先清空 —— 读到残留码即抛 "glGetError mismatch"，
+///   OpenGL 后端创建失败；MC 随即回退 Vulkan，libshaderc.dylib 编译着色器时
+///   SIGSEGV 于 TGlslangToSpvTraverser::visitAggregate。
+///   即：shaderc 崩溃是次生的，真正的起点是残留错误码。
+///   26.2 的 LWJGL 3.4.1 GL.createCapabilities() 同样是先 GetError 再判
+///   （GL.java:455 `if (callI(GetError) == GL_NO_ERROR && ...)`），
+///   残留码会把它踢进 else 分支，因此一并受益。
+///
+/// 渲染器以 RTLD_LOCAL 载入（隔离其内嵌 glslang 所需），glGetError 必须用显式
+/// 句柄取：dlsym(RTLD_DEFAULT) 会命中 iOS 系统 OpenGLES.framework 的桩，那份
+/// 实现与我们的 EGL 上下文无关（诊断日志已坐实 glGetString(GL_VERSION)=(NULL)）。
+/// 取到后以 dladdr 验明镜像，拒绝系统框架；拿不到可信实现则直接返回 ——
+/// 宁可不清空，也不调用一份会崩的指针。
+static void pojavClearGLErrors(void) {
+    NSString *renderer = NSProcessInfo.processInfo.environment[@"AMETHYST_RENDERER"];
+    if (renderer.length == 0) return;
+
+    NSString *rpath = [NSString stringWithFormat:@"@rpath/%@", renderer];
+    void *handle = dlopen(rpath.UTF8String, RTLD_NOLOAD);
+    if (handle == NULL) {
+        NSDebugLog(@"[egl_bridge] clearGLErrors: %@ not mapped, skipped", renderer);
+        return;
+    }
+    void *sym = dlsym(handle, "glGetError");
+    if (sym == NULL) {
+        NSDebugLog(@"[egl_bridge] clearGLErrors: glGetError not exported by %@", renderer);
+        return;
+    }
+    Dl_info info;
+    if (dladdr(sym, &info) == 0 || info.dli_fname == NULL) return;
+    if (strstr(info.dli_fname, "OpenGLES.framework") != NULL ||
+        strstr(info.dli_fname, "OpenGL.framework") != NULL) {
+        NSLog(@"[egl_bridge] clearGLErrors: rejecting system stub (%s)", info.dli_fname);
+        return;
+    }
+
+    // 不依赖 GL 头文件：glGetError 的返回类型即 GLenum(unsigned int)，
+    // GL_NO_ERROR 为 0。
+    typedef unsigned int (*glGetError_fn)(void);
+    glGetError_fn getError = (glGetError_fn)sym;
+
+    // 上限防御：即便实现异常（恒返回非 0）也不至于死循环。
+    const int kMaxDrain = 32;
+    int drained = 0;
+    while (getError() != 0 && drained < kMaxDrain) drained++;
+
+    NSLog(@"[egl_bridge] clearGLErrors: drained %d pending GL error(s) (via %s)",
+          drained, info.dli_fname);
+}
+
 void pojavMakeCurrent(basic_render_window_t* window) {
     if (g_pojavContextIsVulkanLayer) {
         NSLog(@"[egl_bridge] pojavMakeCurrent ignored: Vulkan path (CAMetalLayer), no EGL context to make current");
@@ -611,6 +669,9 @@ void* pojavCreateContext(basic_render_window_t* contextSrc) {
     if (bundle != NULL) {
         NSLog(@"[egl_bridge] pojavCreateContext: making bundle=%p current on this thread", bundle);
         pojavMakeCurrent(bundle);
+        // 上下文刚在本线程 current，此时清空 MobileGlues constructor 阶段遗留的
+        // 错误码，避免 MC 的 glGetError() 可用性判定读到残留而被迫回退 Vulkan。
+        pojavClearGLErrors();
     } else {
         NSLog(@"[egl_bridge] pojavCreateContext: br_init_context returned NULL, skipping makeCurrent");
     }
