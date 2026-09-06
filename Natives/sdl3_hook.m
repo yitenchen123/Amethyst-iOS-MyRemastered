@@ -426,6 +426,9 @@ static bool ame_eglSurfacePixelSizeFromUIKit(int *outW, int *outH) {
 // 真实像素尺寸，天然反映启动器的 resolutionScale（100% -> 2436x1124，
 // 75% -> 1827x843），不像 UIScreen 兜底那样恒为全屏分辨率。
 // 有了它，渲染线程再也不必为拿一个尺寸而去读 UIKit。
+// ame_rendererHandle 的实现在文件后部（约第 1400 行），此处提前声明以便本节使用。
+static void *ame_rendererHandle(void);
+
 #define AME_EGL_DRAW     0x3059
 #define AME_EGL_WIDTH    0x305D
 #define AME_EGL_HEIGHT   0x305E
