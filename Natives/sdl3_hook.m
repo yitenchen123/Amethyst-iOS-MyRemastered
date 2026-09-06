@@ -1739,6 +1739,22 @@ static bool ame_isCriticalGlProbe(const char *name) {
            strcmp(name, "glGetStringi") == 0;
 }
 
+// 是否应当介入本次 GL 入口点查询。
+//
+// 只介入全局查找 dlsym(RTLD_DEFAULT/NULL, ...)。LWJGL 3.4.x 正是这样取 GL
+// 入口点（GLFW.java:587 的 MacOSXLibraryDL 用 RTLD_DEFAULT），这是 26.2
+// "no OpenGL context current" 需要纠正的那条路。
+//
+// 而渲染器自己查自己的 GLES 符号时用的是显式句柄（MobileGlues 的
+// proc_address(gles, name) == dlsym(gles_handle, name)）：调用方已明确指定
+// 镜像，无需我们纠正。介入它有害 —— 每次查询都会走到 ame_glSymbolTrusted()
+// 的 dladdr()，而这段解析发生在渲染器 dylib 的 constructor 期间，此时 dyld
+// 正持有加载锁；反复 dladdr 与之争用即死锁，表现为初始化卡死（26.2 +
+// mobileglues 黑屏 45s、无声音、无崩溃堆栈）。
+static bool ame_shouldMeddleGlEntry(void *handle) {
+    return handle == RTLD_DEFAULT || handle == NULL;
+}
+
 static int ame_glProbeLogBudget = 16;
 
 static void ame_logGlProbe(const char *name, void *def, void *rh) {
@@ -1758,6 +1774,9 @@ static void ame_logGlProbe(const char *name, void *def, void *rh) {
 static void *ame_resolveGlEntry(void *handle, const char *name) {
     // glViewport 由调用方上方的分支单独处理（返回包装版本），此处不再介入。
     if (strcmp(name, "glViewport") == 0) return NULL;
+
+    // 显式句柄查询（渲染器自解析）一律放行，理由见 ame_shouldMeddleGlEntry。
+    if (!ame_shouldMeddleGlEntry(handle)) return NULL;
 
     void *def = (amethyst_orig_dlsym != NULL)
                     ? amethyst_orig_dlsym(handle, name)
@@ -1796,6 +1815,8 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
     // 也可能直接 dlsym 取 GL 入口。这里双保险，确保两条路都拿到包装版本。
     // 拿不到真实指针时返回 NULL（= 不接管），由调用方回落原始 dlsym 结果。
     if (strcmp(name, "glViewport") == 0) {
+        // 渲染器自解析（显式句柄）放行，理由见 ame_shouldMeddleGlEntry。
+        if (!ame_shouldMeddleGlEntry(handle)) return NULL;
         // 只认渲染器镜像里的实现。绝不回退 RTLD_DEFAULT：渲染器是 RTLD_LOCAL，
         // 全局表里那一份属于系统 OpenGLES 框架，拿它纠正 viewport 无效且会崩。
         if (ame_real_glViewport == NULL ||
