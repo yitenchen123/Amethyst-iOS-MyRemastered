@@ -1012,8 +1012,11 @@ static ame_fn_glViewport ame_resolve_glViewport(void) {
     void *rh = ame_rendererHandle();
     if (rh != NULL)
         ame_real_glViewport = (ame_fn_glViewport)dlsym(rh, "glViewport");
-    if (ame_real_glViewport == NULL)
-        ame_real_glViewport = (ame_fn_glViewport)dlsym(RTLD_DEFAULT, "glViewport");
+    // 刻意不回退 dlsym(RTLD_DEFAULT)：渲染器以 RTLD_LOCAL 载入时，全局符号表里
+    // 的 glViewport 可能来自别的 GL 实现（系统 GLES / EAGL / 被 GLOBAL 加载的
+    // ANGLE）。那与当前 EGL 上下文不匹配，一经调用即崩 —— 这正是本文件在
+    // ame_SDL_GL_GetProcAddress 处注明的风险。取不到就不调用，最坏是兜底不生效，
+    // 远优于引入崩溃。
     return ame_real_glViewport;
 }
 
@@ -1260,13 +1263,32 @@ static void *ame_rendererHandle(void) {
     const char *renderer = getenv("AMETHYST_RENDERER");
     if (renderer == NULL || renderer[0] == '\0') return NULL;
     NSString *path = [NSString stringWithFormat:@"@rpath/%s", renderer];
-    // 渲染器已由 pojavInitOpenGL 以 RTLD_GLOBAL 预加载，此处返回同一句柄，
-    // 仅增加引用计数，不会重复映射。
-    g_rendererHandle = dlopen(path.UTF8String, RTLD_NOW | RTLD_GLOBAL);
-    if (g_rendererHandle == NULL) {
-        NSDebugLog(@"[SDLHook] renderer dlopen('%@') failed: %s",
-                   path, dlerror() ?: "unknown");
+
+    // 必须用 RTLD_NOLOAD：绝不可带 RTLD_GLOBAL，也不可退回"普通"dlopen。
+    //
+    // 渲染器由 pojavInitOpenGL 以 RTLD_LOCAL 载入，目的就是把它内嵌的 glslang
+    // 关在自己的镜像里 —— 一旦进入全局符号空间，便会与 libshaderc.dylib 中那份
+    // glslang 合并、共用线程局部的 AST 内存池，随后在
+    // TGlslangToSpvTraverser::visitAggregate 解引用到已释放内存而 SIGSEGV
+    // （26.3 上崩溃地址固定为 libshaderc.dylib+0x155820）。
+    //
+    // 而 dlopen 一个已加载的镜像时若带上 RTLD_GLOBAL，会把原本 RTLD_LOCAL 的
+    // 镜像提升为全局可见 —— 隔离被静默解除，既无报错也无日志。这正是 MobileGL
+    // 原本安全、接入 viewport 解析之后反而崩溃的原因：新代码首次调用到本函数，
+    // 触发了这次提升。
+    //
+    // RTLD_NOLOAD 只查询既有映射、不改变其可见性。dlsym 用显式句柄取符号，对
+    // RTLD_LOCAL 镜像同样有效，故功能完全不受影响。@rpath + RTLD_NOLOAD 在本
+    // 仓库已有先例（egl_bridge 的预载探测即用此组合）。
+    void *h = dlopen(path.UTF8String, RTLD_NOW | RTLD_NOLOAD);
+    if (h == NULL) {
+        // 渲染器尚未载入。此处刻意不退化为不带 RTLD_NOLOAD 的 dlopen —— 那会
+        // 以默认可见性重新加载，同样绕过隔离。返回 NULL，让调用方安全跳过。
+        NSDebugLog(@"[SDLHook] renderer not loaded yet (RTLD_NOLOAD): %s",
+                   dlerror() ?: "unknown");
+        return NULL;
     }
+    g_rendererHandle = h;
     return g_rendererHandle;
 }
 
@@ -1334,11 +1356,10 @@ static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void) {
     void *rh = ame_rendererHandle();
     if (rh != NULL)
         ame_real_glGetIntegerv = (ame_fn_glGetIntegerv)dlsym(rh, "glGetIntegerv");
-    if (ame_real_glGetIntegerv == NULL)
-        ame_real_glGetIntegerv =
-            (ame_fn_glGetIntegerv)dlsym(RTLD_DEFAULT, "glGetIntegerv");
-    NSDebugLog(@"[SDLHook] glGetIntegerv resolved=%p",
-               (void *)ame_real_glGetIntegerv);
+    // 同 ame_resolve_glViewport：刻意不回退 dlsym(RTLD_DEFAULT)，否则可能拿到与
+    // 当前 EGL 上下文不匹配的另一份实现，调用即崩。取不到就跳过本次观测。
+    NSDebugLog(@"[SDLHook] glGetIntegerv resolved=%p (renderer handle %p)",
+               (void *)ame_real_glGetIntegerv, (void *)rh);
     return ame_real_glGetIntegerv;
 }
 
@@ -1445,8 +1466,9 @@ static void *ame_SDL_GL_GetProcAddress(const char *proc) {
             void *rh = ame_rendererHandle();
             if (rh != NULL)
                 ame_real_glViewport = (ame_fn_glViewport)dlsym(rh, proc);
-            if (ame_real_glViewport == NULL)
-                ame_real_glViewport = (ame_fn_glViewport)dlsym(RTLD_DEFAULT, proc);
+            // 同 ame_resolve_glViewport：不回退 RTLD_DEFAULT。取不到就原样放行，
+            // 让 MC 拿到本路径本会给出的结果 —— 宁可不包装，也不包装一份可能
+            // 与当前上下文不匹配的实现。
         }
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
     }
