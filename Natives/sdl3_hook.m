@@ -445,13 +445,37 @@ static bool ame_surfaceSizeFromEGL(int *outW, int *outH) {
     static ame_fn_eglGetCurrentSurface  gcs = NULL;
     static ame_fn_eglQuerySurface       qs  = NULL;
     static bool resolved = false;
-    if (!resolved) {
-        resolved = true;
+
+    // 不做一次性锁死，且必须校验镜像可信性。
+    //
+    // 原实现在首次调用时把 resolved 永久置 true，之后即使指针落在不可信镜像
+    // （另一份 EGL 实现）也不再重新解析。eglGetCurrentDisplay 取自镜像 A、
+    // eglQuerySurface 取自镜像 B 时，qs(dpy, ...) 就是跨 EGL 实现调用 ——
+    // 两份实现各自维护上下文状态，一经调用即 SIGSEGV。
+    //
+    // 这正是 26.3 在 SDL_GL_MakeCurrent 之后崩溃的原因：本函数原先只在 swap 前
+    // 调用，加到 MakeCurrent 路径后，首次解析刚好发生在 EGL 上下文刚建立的时刻，
+    // 解析结果锁死为不可用的一份，随后的 qs() 直接崩。
+    //
+    // 改为每次校验：不可信就重新解析；拿不到可信实现则放弃 EGL 查询，
+    // 由 ame_eglSurfacePixelSize 退回缓存/兜底尺寸（最坏是兜底不生效，不崩）。
+    bool trusted = resolved &&
+                   ame_glSymbolTrusted((const void *)gcd) &&
+                   ame_glSymbolTrusted((const void *)gcs) &&
+                   ame_glSymbolTrusted((const void *)qs);
+    if (!trusted) {
         gcd = (ame_fn_eglGetCurrentDisplay)dlsym(rh, "eglGetCurrentDisplay");
         gcs = (ame_fn_eglGetCurrentSurface)dlsym(rh, "eglGetCurrentSurface");
         qs  = (ame_fn_eglQuerySurface)dlsym(rh, "eglQuerySurface");
+        trusted = ame_glSymbolTrusted((const void *)gcd) &&
+                  ame_glSymbolTrusted((const void *)gcs) &&
+                  ame_glSymbolTrusted((const void *)qs);
+        resolved = trusted;
+        if (!trusted) {
+            gcd = NULL; gcs = NULL; qs = NULL;
+            return false;
+        }
     }
-    if (gcd == NULL || gcs == NULL || qs == NULL) return false;
 
     void *dpy = gcd();
     void *surf = gcs(AME_EGL_DRAW);
