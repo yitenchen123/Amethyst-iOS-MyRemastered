@@ -9,6 +9,11 @@
 #include "gl_bridge.h"
 #include "utils.h"
 
+// MobileGlues 运行时使用的 EGL：打包在 App Frameworks 下的 libEGL.framework。
+// 与 Natives/external/MobileGlues/src/main/cpp/external/libEGL.framework 对应。
+// 已核对：该镜像导出 dlsym_EGL() 需要的全部 18 个 egl* 符号。
+#define AME_EGL_FRAMEWORK_PATH "libEGL.framework/libEGL"
+
 // 由 Natives/SurfaceViewController.m 提供，用于修正 SDL3 嵌入导致的 OpenGL 后端黑屏。
 // 详见下方 gl_init_context() 中的说明。GLFW 路径（1.21.1 等）下两者均为空操作。
 extern BOOL Amethyst_RestoreGameSurfaceVisibility(void);
@@ -35,7 +40,37 @@ static bool dlsym_EGL() {
     //     个配置，触发 gl_init_context 里的 assert(bundle->config) 崩溃。
     //   - 其余渲染器（gl4es / ANGLE / MobileGlues / LTW）：仍从 ANGLE 解析。
     const char *renderer = getenv("AMETHYST_RENDERER");
-    const char *eglLibrary = isSelfEglRenderer(renderer) ? renderer : RENDERER_NAME_MTL_ANGLE;
+    //
+    // MobileGlues 的 EGL 必须取自它自己链接的那份 EGL，而不是 ANGLE。
+    //
+    // MobileGlues 的 external/ 目录里带的正是 libEGL.framework / libGLESv2.framework
+    // 两个 .tbd，即它在运行时使用内置 libEGL.framework 的 egl* 入口点；其 GL 层
+    // （glGetString 等）也建立在这份 EGL 的 current context 之上。
+    //
+    // 而此处原先一律回落到 libtinygl4angle.dylib —— 那是 ANGLE 的**另一份副本**
+    // （两份都导出 egl* 且都带 ANGLE 扩展，但彼此是独立镜像，各自维护 current
+    // context 状态）。于是 br_init_context 用 tinygl4angle 的 eglMakeCurrent 建立
+    // 主上下文后，MobileGlues 侧查自己的 EGL 仍看不到任何 current context：
+    // glGetString(GL_VERSION) 返回 NULL，LWJGL 3.4.1 随即在 GL.java:456 抛出
+    // "There is no OpenGL context current in the current thread."。
+    //
+    // 这与 MobileGL / Mithril 的情况完全同构（两者早已因同样原因从自身解析 EGL），
+    // 差别只是 MobileGlues 的 EGL 在独立的 framework 中，不在它自己的 dylib 里。
+    //
+    // 仅影响 MobileGlues：其余渲染器取值顺序与改动前逐字相同。
+    // 逃生开关：AMETHYST_MOBILEGLUES_EGL_ANGLE=1 可恢复为从 ANGLE 解析。
+    const char *forceAngleEgl = getenv("AMETHYST_MOBILEGLUES_EGL_ANGLE");
+    BOOL mobileGluesOwnEgl = renderer &&
+                             strcmp(renderer, RENDERER_NAME_MOBILEGLUES) == 0 &&
+                             !(forceAngleEgl && forceAngleEgl[0] == '1');
+    const char *eglLibrary;
+    if (isSelfEglRenderer(renderer)) {
+        eglLibrary = renderer;                    // Mithril / MobileGL：自身 EGL
+    } else if (mobileGluesOwnEgl) {
+        eglLibrary = AME_EGL_FRAMEWORK_PATH;      // MobileGlues：内置的 libEGL.framework
+    } else {
+        eglLibrary = RENDERER_NAME_MTL_ANGLE;     // gl4es / ANGLE / LTW / zink：ANGLE
+    }
     NSString *eglPath = [NSString stringWithFormat:@"@rpath/%s", eglLibrary ?: ""];
     //
     // MobileGL 以 RTLD_LOCAL 载入（参照 MojoLauncher mojoexec_acq_egl_handle() 的
@@ -81,6 +116,14 @@ static bool dlsym_EGL() {
                         !(forceAngleGlobal && forceAngleGlobal[0] == '1'));
     int eglDlFlags = RTLD_NOW | (useLocalEGL ? RTLD_LOCAL : RTLD_GLOBAL);
     void* dl_handle = dlopen(eglPath.UTF8String, eglDlFlags);
+    if (!dl_handle && strcmp(eglLibrary, RENDERER_NAME_MTL_ANGLE) != 0) {
+        // 首选 EGL 不可用：回落到 ANGLE，与改动前的行为完全一致（不更差）。
+        NSLog(@"EGLBridge: %@ unavailable for renderer %s (%s); falling back to %s",
+              eglPath, renderer ?: "<unset>", dlerror() ?: "unknown dlopen error",
+              RENDERER_NAME_MTL_ANGLE);
+        eglPath = [NSString stringWithFormat:@"@rpath/%s", RENDERER_NAME_MTL_ANGLE];
+        dl_handle = dlopen(eglPath.UTF8String, RTLD_NOW | RTLD_GLOBAL);
+    }
     if (!dl_handle) {
         NSLog(@"EGLBridge: failed to load %@ for renderer %s: %s",
             eglPath, renderer ?: "<unset>", dlerror() ?: "unknown dlopen error");
