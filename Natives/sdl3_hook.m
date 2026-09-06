@@ -955,6 +955,10 @@ static int ame_proxyEglSwapBuffers(void *dpy, void *surface) {
 // 它依赖 ame_primaryWindow / ame_real_GetWindowSizeInPixels 等后部符号，
 // 直接前移会引入大量重复声明。C 允许先声明后定义，故用前向声明桥接，
 // 让 ame_maybeWrapGl 能在文件前部就把包装挂上 GL 函数指针。
+// ame_rendererHandle 定义在文件更靠后处（渲染器句柄解析），这里需要用，
+// 故先声明。C 要求静态函数先用后定义时必须前置声明，否则编译报错。
+static void *ame_rendererHandle(void);
+
 typedef void (*ame_fn_glViewport)(int32_t x, int32_t y,
                                   int32_t width, int32_t height);
 
