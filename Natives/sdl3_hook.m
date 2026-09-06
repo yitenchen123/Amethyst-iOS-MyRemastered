@@ -1661,6 +1661,64 @@ static void *ame_SDL_GL_GetCurrentContext(void) {
 
 #pragma mark - 对 main_hook.m 的接入点
 
+/// GL 入口点符号名判定：gl + 大写字母（glGetString / glGetIntegerv / glViewport ...）。
+/// 刻意不匹配 C++ mangled 名（_ZN...）与小写开头的内部符号，避免误伤渲染器内嵌的 glslang。
+static bool ame_isGlEntryName(const char *name) {
+    if (name == NULL) return false;
+    if (name[0] != 'g' || name[1] != 'l') return false;
+    unsigned char c = (unsigned char)name[2];
+    return (c >= 'A' && c <= 'Z');
+}
+
+static int ame_glRedirectLogBudget = 12;
+
+// —— GL 入口点重定向：26.2 "no OpenGL context current" 的根因修复 ——
+//
+// LWJGL 3.4.x 的 MacOSXLibraryDL 以 dlsym(RTLD_DEFAULT, name) 取 GL 入口点
+// （Pojav 改过的 GLFW.java:587：new MacOSXLibraryDL(..., RTLD_DEFAULT)）。
+// 渲染器以 RTLD_LOCAL 载入时，全局符号表里并不存在它的 gl* 符号，dlsym 于是命中
+// iOS 系统 OpenGLES.framework 的桩 —— 该桩不属于我们的 EGL 上下文，
+// glGetString(GL_VERSION) 恒返回 NULL、glGetIntegerv(GL_MAJOR_VERSION) 恒返回 -1。
+// GL.createCapabilities() 据此判定"无上下文"并抛 IllegalStateException
+// （GL.java:456），即 26.2 的崩溃。
+//
+// 诊断佐证（gl_bridge 探针，26.2 + mobileglues 实测）：
+//   dlsym(RTLD_DEFAULT,"glGetString") image=.../OpenGLES.framework/OpenGLES
+//   glGetString(GL_VERSION)=(NULL)   glGetIntegerv(GL_MAJOR_VERSION)=-1
+// 而同一时刻 eglGetCurrentContext=0x1 —— EGL 层上下文是有的，错在符号解析这一层。
+//
+// 修法：默认解析结果不可信（系统框架桩或空）时，改从渲染器句柄取同名符号。默认
+// 结果可信时一律不干预 —— 对原本正常的渲染器（MobileGL、gl4es、zink 等）行为完全
+// 不变，这是本改动的安全边界。
+static void *ame_resolveGlEntry(void *handle, const char *name) {
+    // glViewport 由调用方上方的分支单独处理（返回包装版本），此处不再介入。
+    if (strcmp(name, "glViewport") == 0) return NULL;
+
+    void *def = (amethyst_orig_dlsym != NULL)
+                    ? amethyst_orig_dlsym(handle, name)
+                    : dlsym(RTLD_DEFAULT, name);
+    if (ame_glSymbolTrusted(def)) return NULL;   // 原路径可用，不接管
+
+    void *rh = ame_rendererHandle();
+    if (rh != NULL) {
+        void *p = dlsym(rh, name);
+        if (ame_glSymbolTrusted(p)) {
+            if (ame_glRedirectLogBudget > 0) {
+                ame_glRedirectLogBudget--;
+                NSDebugLog(@"[SDLHook] GL entry '%s': RTLD_DEFAULT stub rejected, "
+                            "using renderer impl %p", name, p);
+            }
+            return p;
+        }
+    }
+    if (ame_glRedirectLogBudget > 0) {
+        ame_glRedirectLogBudget--;
+        NSDebugLog(@"[SDLHook] GL entry '%s': no trusted impl (default=%p, renderer=%p)",
+                    name, def, rh);
+    }
+    return NULL;
+}
+
 /// 由 hooked_dlsym 在返回 orig_dlsym 之前调用。
 /// 返回非 NULL 表示本模块接管了该符号；否则返回 NULL 让调用方走原路径。
 void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
@@ -1685,6 +1743,15 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
         // 拿不到可信实现就不接管：宁可让 MC 用它原本会拿到的指针，
         // 也不包装一份一调用就崩的桩。
         if (ame_real_glViewport != NULL) return (void *)ame_glViewport;
+        return NULL;
+    }
+
+    // LWJGL 3.4.x 取 GL 入口点时命中系统 OpenGLES 桩，导致 26.2 判定"无上下文"
+    // （详见 ame_resolveGlEntry 处注释）。仅在原路径不可用时才接管。
+    if (ame_isGlEntryName(name)) {
+        void *glsym = ame_resolveGlEntry(handle, name);
+        if (glsym != NULL) return glsym;
+        // 拿不到可信实现则不接管，交由调用方回落原始 dlsym 结果。
         return NULL;
     }
 
