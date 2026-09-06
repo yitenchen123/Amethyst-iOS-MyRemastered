@@ -756,6 +756,29 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         NSLog(@"[JavaLauncher] Warning: SurfaceViewController class unavailable, Metallum will fall back to ObjC runtime lookup");
     }
 
+    // —— Sodium 启动检查规避（仅限 iOS 上必然误报的那一项）——
+    //
+    // Sodium 的 PreLaunchChecks 校验 LWJGL 运行时版本：
+    //     isUsingKnownCompatibleLwjglVersion()
+    //         = Version.getVersion().startsWith(REQUIRED_LWJGL_VERSION)
+    // REQUIRED_LWJGL_VERSION 由 Sodium 自行在编译期内联（1.20.1 -> 3.3.1，
+    // 1.20.6 / 1.21 -> 3.3.3）。而本启动器为 26.2+ 提供 LWJGL 3.4.1 —— 26.3 的
+    // SDL3 绑定需要它，无法降级。字符串比较必然失败，Sodium 随即弹出
+    // "Unsupported LWJGL" 并中止启动。
+    //
+    // Sodium 官方为这类检查留了关闭开关：BugChecks.configureCheck() 读取系统属性
+    // sodium.checks.<name>，issue2561 即 LWJGL 版本那一项（见 Sodium wiki
+    // "Disabling Bug Checks"）。这里以官方支持的方式关闭它，而不是伪造 LWJGL
+    // 版本号 —— 后者会让 Sodium 依据错误的版本信息做后续判断，风险更大。
+    //
+    // 另一项 isUsingPojavLauncher()（PostLaunchChecks）在 iOS 上本不会命中：它只
+    // 检查环境变量 POJAV_RENDERER，以及 java.library.path 中形如
+    // /data/user/<n>/net.kdt.pojavlaunch 的 Android 路径。本启动器设置的是
+    // AMETHYST_RENDERER，library.path 指向 app 内的 Frameworks 目录，两者都不匹配。
+    // 下方仍做一次防御性清理，防止"自定义环境变量"等途径把它带进来。
+    unsetenv("POJAV_RENDERER");
+    PUSH_MARGV_LITERAL("-Dsodium.checks.issue2561=false");
+
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.glfw.checkThread0=false");
     PUSH_MARGV_LITERAL("-Dorg.lwjgl.system.allocator=system");
     //PUSH_MARGV_LITERAL("-Dorg.lwjgl.util.NoChecks=true");
