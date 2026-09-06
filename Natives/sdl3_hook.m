@@ -728,6 +728,91 @@ static bool ame_pushWindowResized(void *window) {
     return pushed;
 }
 
+#pragma mark - 窗口尺寸事件出口统一（小窗根本修复）
+
+// —— 为什么必须接管事件出口 ——
+//
+// 此前所有补丁都打在「查询」上：SDL_GetWindowSize / GetWindowSizeInPixels /
+// GL_GetDrawableSize 早已接管，回报 EGL surface 的真实像素。但 MC 依然设出了
+// 812x375 的 viewport —— 日志里 ame_viewportIsBad 命中「SDL window points used
+// as pixels」，而该判定比对的正是 SDL 真实查询返回的 812x375。
+//
+// 这说明 MC 那一帧用的值不是查来的，而是**事件给的**：SDL 内部窗口状态停在
+// 812x375（uikit 后端把传入值当 points、再 clamp 到屏幕），布局变化时它自行
+// 派发 WINDOW_RESIZED，data1/data2 就是 812x375。该事件由 SDL 内部直接入队，
+// 不走公开入口，我们补发的那一条 2436x1125 无法取代它 —— 补发只是多了一条，
+// 坏的那条照样会被 MC 消费。这也解释了「必须手动改一次分辨率才恢复」：
+// 手动改才会让 SDL 发出一个尺寸不同的事件。
+//
+// ZL2/FCL 没有这个问题，是因为它们的后端（Android）window 尺寸与像素恒等，
+// SDL 内部状态本身就是对的，派发的事件自然也是对的。我们在 iOS 上无法把内部
+// 状态变成像素，唯一等价的做法是**统一出口**：查询已统一，事件也统一。
+//
+// 于是 hook SDL_PollEvent，在事件交给 MC 之前把窗口尺寸改写为 EGL surface 像素。
+// MC 无论直接取 data1/data2、还是收到后重新查询，拿到的都是同一个值 ——
+// 这正是 ZL2 那种「内部自洽」在外部可见行为上的等价物。
+//
+// 只改 WINDOW_RESIZED(0x206)：PIXEL_SIZE_CHANGED 的类型号版本间不保证稳定，
+// 且 MC 收到它会触发重新查询，而查询已统一，无需改写。
+typedef bool (*ame_fn_SDL_PollEvent)(void *event);
+typedef bool (*ame_fn_SDL_WaitEventTimeout)(void *event, int32_t timeoutMS);
+
+static ame_fn_SDL_PollEvent ame_real_PollEvent = NULL;
+static ame_fn_SDL_PollEvent ame_real_WaitEvent = NULL;
+static ame_fn_SDL_WaitEventTimeout ame_real_WaitEventTimeout = NULL;
+static int ame_eventRewriteLogBudget = 8;
+
+static void ame_rewriteWindowSizeEvent(void *event) {
+    if (event == NULL) return;
+    ame_SDL_Event *ev = (ame_SDL_Event *)event;
+    if (ev->window.type != AME_SDL_EVENT_WINDOW_RESIZED) return;
+
+    // 先判类型再查尺寸：PollEvent 每帧多次调用，非窗口事件零开销。
+    int pw = 0, ph = 0;
+    if (!ame_eglSurfacePixelSize(&pw, &ph)) return;
+    if (pw <= 0 || ph <= 0) return;
+    if (ev->window.data1 == (int32_t)pw && ev->window.data2 == (int32_t)ph) return;
+
+    if (ame_eventRewriteLogBudget > 0) {
+        ame_eventRewriteLogBudget--;
+        NSDebugLog(@"[SDLHook] WINDOW_RESIZED event %dx%d -> %dx%d px (EGL surface)",
+                   ev->window.data1, ev->window.data2, pw, ph);
+    }
+    ev->window.data1 = (int32_t)pw;
+    ev->window.data2 = (int32_t)ph;
+}
+
+static bool ame_SDL_PollEvent(void *event) {
+    if (ame_real_PollEvent == NULL) {
+        ame_real_PollEvent =
+            (ame_fn_SDL_PollEvent)ame_real_dlsym("SDL_PollEvent");
+    }
+    bool got = (ame_real_PollEvent != NULL) ? ame_real_PollEvent(event) : false;
+    if (got) ame_rewriteWindowSizeEvent(event);
+    return got;
+}
+
+static bool ame_SDL_WaitEvent(void *event) {
+    if (ame_real_WaitEvent == NULL) {
+        ame_real_WaitEvent =
+            (ame_fn_SDL_PollEvent)ame_real_dlsym("SDL_WaitEvent");
+    }
+    bool got = (ame_real_WaitEvent != NULL) ? ame_real_WaitEvent(event) : false;
+    if (got) ame_rewriteWindowSizeEvent(event);
+    return got;
+}
+
+static bool ame_SDL_WaitEventTimeout(void *event, int32_t timeoutMS) {
+    if (ame_real_WaitEventTimeout == NULL) {
+        ame_real_WaitEventTimeout =
+            (ame_fn_SDL_WaitEventTimeout)ame_real_dlsym("SDL_WaitEventTimeout");
+    }
+    bool got = (ame_real_WaitEventTimeout != NULL)
+                   ? ame_real_WaitEventTimeout(event, timeoutMS) : false;
+    if (got) ame_rewriteWindowSizeEvent(event);
+    return got;
+}
+
 #pragma mark - 事件窗口解析回落（对齐 ZL2）
 
 // SDL 的鼠标焦点（mouse->focus）会被 SDL_UpdateMouseFocus 的坐标越界判定清除：
@@ -1504,154 +1589,16 @@ static void *ame_SDL_GL_CreateContext(void *window) {
     return ctx;
 }
 
-// AME_GL_VIEWPORT 与两个 GL 入口点解析函数定义在文件后部，此处提前声明，
-// 以便 ame_applyViewportAfterMakeCurrent 在 MakeCurrent 路径上使用。
-#define AME_GL_VIEWPORT 0x0BA2
-
-typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
-
 static ame_fn_glViewport ame_resolve_glViewport(void);
-static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
-
-// —— MakeCurrent 后立即把 viewport 对齐到 EGL surface ——
-//
-// swap 前那一层修正是「渲染之后」的兜底：第一帧已经用错误 viewport 画完，
-// 若 MC 每帧都重设错值，它就永远晚一帧。这里补上更早的一环 ——
-// 上下文刚 current、尚未有任何绘制时，直接把 viewport 设为 surface 尺寸。
-//
-// 此刻设 viewport 是安全的：viewport 是上下文级 GL 状态，与 FBO 绑定无关；
-// 且此时 MC 还没有任何渲染，不存在覆盖其合法设置的可能。之后 MC 若自行
-// 设为别的值，仍由 swap 前那层守护兜底，两道防线互不冲突。
-//
-// 采用无条件设置而非「先判坏再设」：判定函数 ame_viewportIsBad 会回调 SDL
-// 真实查询，而此刻 SDL 窗口状态可能尚未完成 resize，不如直接对齐 surface。
-static void ame_applyViewportAfterMakeCurrent(void) {
-    static bool appliedOnce = false;
-
-    int eglW = 0, eglH = 0;
-    if (!ame_eglSurfacePixelSize(&eglW, &eglH)) return;
-    if (eglW <= 0 || eglH <= 0) return;
-
-    ame_fn_glViewport setVp = ame_resolve_glViewport();
-    if (setVp == NULL) {
-        if (!appliedOnce) {
-            appliedOnce = true;
-            NSDebugLog(@"[SDLHook] MakeCurrent viewport NOT applied: glViewport unresolved");
-        }
-        return;
-    }
-
-    // 读一次改前值，仅用于日志判断这次修正是否真的有必要。
-    int32_t before[4] = {0, 0, 0, 0};
-    ame_fn_glGetIntegerv getIv = ame_resolve_glGetIntegerv();
-    if (getIv != NULL) {
-        getIv(AME_GL_VIEWPORT, before);
-    }
-
-    if ((int32_t)eglW == before[2] && (int32_t)eglH == before[3]) {
-        if (!appliedOnce) {
-            appliedOnce = true;
-            NSDebugLog(@"[SDLHook] MakeCurrent viewport already %dx%d (egl surface, ok)", eglW, eglH);
-        }
-        return;
-    }
-
-    setVp(0, 0, (int32_t)eglW, (int32_t)eglH);
-
-    if (!appliedOnce) {
-        appliedOnce = true;
-        NSDebugLog(@"[SDLHook] MakeCurrent viewport %dx%d -> %dx%d (aligned to EGL surface)",
-                   before[2], before[3], eglW, eglH);
-    }
-}
 
 static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
     if (context != NULL) g_glContext = context;
     pojavMakeCurrent(context);
-    // 默认关闭：本函数加进 MakeCurrent 路径后 26.3 在 gl_bridge diag #2 之后
-    // 立即崩溃，而它内部的三条早期 return 都不打日志，无法定位是哪一处。
-    // 在搞清崩溃点之前不让它上每帧必经路径；需要时可用环境变量打开复现。
-    if (ame_envFlagOn("AMETHYST_MC_VIEWPORT_ALIGN", false)) {
-        ame_applyViewportAfterMakeCurrent();
-    }
     NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
     return true;
 }
 
-// —— swap 前观测并修正实际生效的 viewport ——
-//
-// 上面的包装依赖 MC 恰好从我们接管过的路径取 glViewport。但观测表明它可能
-// 另有来源：SDL_GL_GetProcAddress 与 dlsym 两条路都已接管，日志里却一条
-// glViewport 都没有 —— 说明 MC 用了第三条路（已缓存的指针、或直接链接）。
-//
-// 与其继续猜，不如直接读 GL 状态机：glGetIntegerv(GL_VIEWPORT) 返回的是
-// 当前真正生效的值，无论 MC 从哪条路设置。这是唯一无法被绕过的观测点，
-// 它给出的数字能一次性区分两种情况：
-//   - 值是 320x480 / 812x375 等已知错误候选 → 渲染区域确实错了，在此修正；
-//   - 值已等于 EGL surface                 → 问题不在 viewport，需换方向。
-//
-// 判定仍只精确匹配已知错误候选（ame_viewportIsBad），不做比例推断。
-static ame_fn_glGetIntegerv ame_real_glGetIntegerv = NULL;
-static bool ame_glGetIntegervResolved = false;
-static int ame_swapViewportLogBudget = 8;
-
-static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void) {
-    if (ame_glGetIntegervResolved) return ame_real_glGetIntegerv;
-    ame_glGetIntegervResolved = true;
-    void *rh = ame_rendererHandle();
-    if (rh != NULL)
-        ame_real_glGetIntegerv = (ame_fn_glGetIntegerv)dlsym(rh, "glGetIntegerv");
-    // 同 ame_resolve_glViewport：刻意不回退 dlsym(RTLD_DEFAULT)，否则可能拿到与
-    // 当前 EGL 上下文不匹配的另一份实现，调用即崩。取不到就跳过本次观测。
-    NSDebugLog(@"[SDLHook] glGetIntegerv resolved=%p (renderer handle %p)",
-               (void *)ame_real_glGetIntegerv, (void *)rh);
-    return ame_real_glGetIntegerv;
-}
-
-static void ame_enforceViewportAtSwap(void) {
-    ame_fn_glGetIntegerv getIv = ame_resolve_glGetIntegerv();
-    if (getIv == NULL) return;
-
-    int eglW = 0, eglH = 0;
-    if (!ame_eglSurfacePixelSize(&eglW, &eglH)) return;
-
-    int32_t v[4] = {0, 0, 0, 0};
-    getIv(AME_GL_VIEWPORT, v);
-    int32_t vw = v[2];
-    int32_t vh = v[3];
-
-    const char *why = NULL;
-    bool bad = ame_viewportIsBad(vw, vh, eglW, eglH, &why);
-
-    if (ame_swapViewportLogBudget > 0) {
-        ame_swapViewportLogBudget--;
-        NSDebugLog(@"[SDLHook] swap viewport %dx%d (egl surface %dx%d, %s)",
-                   vw, vh, eglW, eglH, bad ? (why ? why : "bad") : "ok");
-    }
-
-    if (!bad) return;
-
-    // viewport 是 GL 状态，一经设置便持续生效。MC 若只在 resize 时设一次
-    // （现象上正是如此 —— 必须手动改分辨率才恢复），这里的修正就一直有效；
-    // 若它每帧重设，则此修正会被下一帧覆盖，但日志已给出真相，可据此
-    // 转而去修它的取值来源，而非继续在此兜底。
-    ame_fn_glViewport setVp = ame_resolve_glViewport();
-    if (setVp == NULL) {
-        if (ame_swapViewportLogBudget > 0) {
-            ame_swapViewportLogBudget--;
-            NSDebugLog(@"[SDLHook] swap viewport NOT fixed: glViewport unresolved");
-        }
-        return;
-    }
-    setVp(0, 0, (int32_t)eglW, (int32_t)eglH);
-    if (ame_swapViewportLogBudget > 0) {
-        ame_swapViewportLogBudget--;
-        NSDebugLog(@"[SDLHook] swap viewport forced -> %dx%d (%s)", eglW, eglH, why);
-    }
-}
-
 static bool ame_SDL_GL_SwapWindow(void *window) {
-    ame_enforceViewportAtSwap();
     pojavSwapBuffers();
     return true;
 }
@@ -1680,7 +1627,7 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
     bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
 
     // 判定统一由 ame_viewportIsBad 承担：swap 前的观测走同一套候选，
-    // 避免两处逻辑各自漂移（见 ame_enforceViewportAtSwap 处注释）。
+    // 判定集中在此，避免多处逻辑各自漂移。
     const char *why = NULL;
     bool bad = haveSurface ? ame_viewportIsBad(width, height, eglW, eglH, &why) : false;
 
@@ -1998,6 +1945,29 @@ void *amethyst_sdl3_hook_resolve(void *handle, const char *name) {
 
     // —— 以下与渲染后端无关，无条件接管 ——
     // GLFW 老路径不加载 libSDL3，根本不会查询这些符号，因此不受影响。
+    // 窗口尺寸事件出口统一：SDL 内部状态停在 points(812x375)，它自行派发的
+    // WINDOW_RESIZED 会把这个错误值交给 MC，必须在此改写为 EGL surface 像素。
+    if (strcmp(name, "SDL_PollEvent") == 0) {
+        if (ame_real_PollEvent == NULL)
+            ame_real_PollEvent =
+                (ame_fn_SDL_PollEvent)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_PollEvent -> window size in EGL pixels");
+        return (void *)ame_SDL_PollEvent;
+    }
+    if (strcmp(name, "SDL_WaitEvent") == 0) {
+        if (ame_real_WaitEvent == NULL)
+            ame_real_WaitEvent =
+                (ame_fn_SDL_PollEvent)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_WaitEvent -> window size in EGL pixels");
+        return (void *)ame_SDL_WaitEvent;
+    }
+    if (strcmp(name, "SDL_WaitEventTimeout") == 0) {
+        if (ame_real_WaitEventTimeout == NULL)
+            ame_real_WaitEventTimeout =
+                (ame_fn_SDL_WaitEventTimeout)amethyst_orig_dlsym(handle, name);
+        NSDebugLog(@"[SDLHook] hooked SDL_WaitEventTimeout -> window size in EGL pixels");
+        return (void *)ame_SDL_WaitEventTimeout;
+    }
     if (strcmp(name, "SDL_GetWindowFromEvent") == 0) {
         if (ame_real_GetWindowFromEvent == NULL)
             ame_real_GetWindowFromEvent =
