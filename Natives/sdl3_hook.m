@@ -1690,6 +1690,32 @@ static int ame_glRedirectLogBudget = 12;
 // 修法：默认解析结果不可信（系统框架桩或空）时，改从渲染器句柄取同名符号。默认
 // 结果可信时一律不干预 —— 对原本正常的渲染器（MobileGL、gl4es、zink 等）行为完全
 // 不变，这是本改动的安全边界。
+/// 决定 LWJGL 能否探测到上下文的几个入口点。对它们无条件打印来源镜像，
+/// 这样即便本次修复没能生效，一次日志也足以看出 26.2 到底解析到了谁的实现
+/// （是系统桩、还是渲染器本身 —— 两者的后续修法完全不同）。
+static bool ame_isCriticalGlProbe(const char *name) {
+    return strcmp(name, "glGetString") == 0 ||
+           strcmp(name, "glGetIntegerv") == 0 ||
+           strcmp(name, "glGetError") == 0 ||
+           strcmp(name, "glGetStringi") == 0;
+}
+
+static int ame_glProbeLogBudget = 16;
+
+static void ame_logGlProbe(const char *name, void *def, void *rh) {
+    if (!ame_isCriticalGlProbe(name)) return;
+    if (ame_glProbeLogBudget <= 0) return;
+    ame_glProbeLogBudget--;
+
+    const char *img = "(unresolved)";
+    Dl_info di;
+    if (def != NULL && dladdr(def, &di) != 0 && di.dli_fname != NULL) {
+        img = di.dli_fname;
+    }
+    NSDebugLog(@"[SDLHook] GL probe '%s': default=%p trusted=%d image=%s renderer=%p",
+               name, def, (int)ame_glSymbolTrusted(def), img, rh);
+}
+
 static void *ame_resolveGlEntry(void *handle, const char *name) {
     // glViewport 由调用方上方的分支单独处理（返回包装版本），此处不再介入。
     if (strcmp(name, "glViewport") == 0) return NULL;
@@ -1697,9 +1723,12 @@ static void *ame_resolveGlEntry(void *handle, const char *name) {
     void *def = (amethyst_orig_dlsym != NULL)
                     ? amethyst_orig_dlsym(handle, name)
                     : dlsym(RTLD_DEFAULT, name);
-    if (ame_glSymbolTrusted(def)) return NULL;   // 原路径可用，不接管
 
     void *rh = ame_rendererHandle();
+    ame_logGlProbe(name, def, rh);
+
+    if (ame_glSymbolTrusted(def)) return NULL;   // 原路径可用，不接管
+
     if (rh != NULL) {
         void *p = dlsym(rh, name);
         if (ame_glSymbolTrusted(p)) {
