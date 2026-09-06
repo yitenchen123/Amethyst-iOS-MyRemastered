@@ -1568,9 +1568,12 @@ static void ame_applyViewportAfterMakeCurrent(void) {
 static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
     if (context != NULL) g_glContext = context;
     pojavMakeCurrent(context);
-    // 上下文刚 current、尚未绘制：把 viewport 对齐到 EGL surface，
-    // 消除「swap 前修正永远晚一帧」的结构性缺陷（见上方函数注释）。
-    ame_applyViewportAfterMakeCurrent();
+    // 默认关闭：本函数加进 MakeCurrent 路径后 26.3 在 gl_bridge diag #2 之后
+    // 立即崩溃，而它内部的三条早期 return 都不打日志，无法定位是哪一处。
+    // 在搞清崩溃点之前不让它上每帧必经路径；需要时可用环境变量打开复现。
+    if (ame_envFlagOn("AMETHYST_MC_VIEWPORT_ALIGN", false)) {
+        ame_applyViewportAfterMakeCurrent();
+    }
     NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
     return true;
 }
