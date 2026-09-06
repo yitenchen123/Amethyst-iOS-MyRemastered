@@ -746,7 +746,7 @@ static bool ame_SDL_InitSubSystem(uint32_t flags) {
 //
 // 这里改为直接采用 EGL surface 的像素尺寸。视图仍会被强制拉回全屏逻辑尺寸
 // （见下方 sdlView.frame），故不影响显示铺满；渲染区域由 EGL surface 决定。
-static void ame_syncReusedWindowSize(void *window, int w, int h) {
+static void ame_syncReusedWindowSize(void *window, int w, int h, bool pushEvent) {
     if (window == NULL || w <= 0 || h <= 0) return;
 
     // 取启动器的 GameSurfaceView —— EGL surface 就绑在它的 layer 上
@@ -826,7 +826,11 @@ static void ame_syncReusedWindowSize(void *window, int w, int h) {
     // 补发一次尺寸事件：MC 可能已在本函数之前查询并缓存了旧值（隐藏工具窗口
     // 的 320x480），而 SDL_SetWindowSize 在尺寸未变时不产生事件。显式补发
     // 确保 MC 一定会重新查询，从而拿到 EGL surface 的真实尺寸。
-    ame_pushWindowResized(window);
+    //
+    // 首次建窗（隐藏工具窗口）时 MC 的事件循环尚未就绪，此时 PushEvent 无意义
+    // 且不安全，由调用方传入 false 跳过 —— 首次建窗本就把尺寸设成了正确值，
+    // MC 从第一次查询起拿到的就是全屏尺寸，无需再靠事件纠正。
+    if (pushEvent) ame_pushWindowResized(window);
 }
 
 #pragma mark - 3) EGL 兼容重试
@@ -1050,7 +1054,7 @@ static void *ame_SDL_CreateWindow(const char *title, int w, int h, uint32_t flag
         ame_primaryWindowRefs++;
         NSDebugLog(@"[SDLHook] reusing primary window %p, refs=%u",
                    ame_primaryWindow, ame_primaryWindowRefs);
-        ame_syncReusedWindowSize(ame_primaryWindow, w, h);
+        ame_syncReusedWindowSize(ame_primaryWindow, w, h, true);
         return ame_primaryWindow;
     }
     void *wnd = ame_real_CreateWindow ? ame_real_CreateWindow(title, w, h, flags) : NULL;
@@ -1059,6 +1063,18 @@ static void *ame_SDL_CreateWindow(const char *title, int w, int h, uint32_t flag
         ame_primaryWindowRefs = 1;
         ame_primaryWindowW = w;
         ame_primaryWindowH = h;
+        // 首次建窗（26.3 的 "RenderPearl OpenGL Hidden Utility Window" 320x480）
+        // 立刻把 SDL 窗口尺寸同步到 EGL surface 的真实像素尺寸。
+        //
+        // 这是「画面缩在左上角」的根因：MC 在紧接着的 SDL_GL_CreateContext /
+        // 能力探测阶段就把窗口尺寸缓存下来了，而后续主窗口是复用本窗口
+        // （reuse，refs=2）——届时再改尺寸、补发事件都已太晚，MC 认知里的
+        // 尺寸早已定死为 320x480。Vulkan 不受影响正是因为它不经 SDL 取尺寸，
+        // 而是直接查 metalview 的 swapchain extent。
+        //
+        // 此处不补发事件（pushEvent=false）：MC 事件循环此刻尚未就绪，而且
+        // 尺寸从第一刻起就是对的，无需事后纠正。
+        ame_syncReusedWindowSize(wnd, w, h, false);
     }
     NSDebugLog(@"[SDLHook] SDL_CreateWindow -> %p", wnd);
     return wnd;
@@ -1081,7 +1097,7 @@ static void *ame_SDL_CreateWindowWithProperties(uint32_t props) {
         if (ame_real_GetNumberProperty != NULL) {
             int pw = (int)ame_real_GetNumberProperty(props, "SDL.window.create.width", 0);
             int ph = (int)ame_real_GetNumberProperty(props, "SDL.window.create.height", 0);
-            ame_syncReusedWindowSize(ame_primaryWindow, pw, ph);
+            ame_syncReusedWindowSize(ame_primaryWindow, pw, ph, true);
         }
         return ame_primaryWindow;
     }
