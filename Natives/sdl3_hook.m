@@ -429,6 +429,11 @@ static bool ame_eglSurfacePixelSizeFromUIKit(int *outW, int *outH) {
 // ame_rendererHandle 的实现在文件后部（约第 1400 行），此处提前声明以便本节使用。
 static void *ame_rendererHandle(void);
 
+// ame_glSymbolTrusted 的实现在文件后部（GL 入口点解析节）。本节在 460 行附近
+// 就要用它校验 EGL 符号镜像，缺少前向声明会被 clang 判为隐式函数声明
+// （-Wimplicit-function-declaration 在 C99 下是 error，CI 因此 exit code 2）。
+static bool ame_glSymbolTrusted(const void *sym);
+
 #define AME_EGL_DRAW     0x3059
 #define AME_EGL_WIDTH    0x305D
 #define AME_EGL_HEIGHT   0x305E
