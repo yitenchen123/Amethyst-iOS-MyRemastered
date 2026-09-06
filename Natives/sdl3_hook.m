@@ -949,6 +949,77 @@ static int ame_proxyEglSwapBuffers(void *dpy, void *surface) {
     return ame_orig_eglSwapBuffers(dpy, surface);
 }
 
+// —— glViewport 兜底：类型与实现分离 ——
+//
+// 类型、真实指针、日志预算声明在此，实现（ame_glViewport）留在文件后部：
+// 它依赖 ame_primaryWindow / ame_real_GetWindowSizeInPixels 等后部符号，
+// 直接前移会引入大量重复声明。C 允许先声明后定义，故用前向声明桥接，
+// 让 ame_maybeWrapGl 能在文件前部就把包装挂上 GL 函数指针。
+typedef void (*ame_fn_glViewport)(int32_t x, int32_t y,
+                                  int32_t width, int32_t height);
+
+static ame_fn_glViewport ame_real_glViewport = NULL;
+static int ame_glViewportLogBudget = 8;
+static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height);
+
+// 判断某个 viewport 是否为「已知的错误候选」。只做精确匹配，不做比例推断，
+// 以免误伤渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
+static bool ame_viewportIsBad(int32_t width, int32_t height,
+                              int eglW, int eglH, const char **why) {
+    *why = NULL;
+    if (eglW <= 0 || eglH <= 0 || width <= 0 || height <= 0) return false;
+    if (width == eglW && height == eglH) return false;
+
+    // 候选一：建窗阶段缓存的隐藏工具窗口尺寸
+    if ((width == 320 && height == 480) || (width == 480 && height == 320)) {
+        *why = "hidden utility window size";
+        return true;
+    }
+    // 候选二：MC 把 SDL 内部的 points 当成了像素
+    int sdlW = 0, sdlH = 0;
+    if (ame_primaryWindow != NULL && ame_real_GetWindowSize != NULL &&
+        ame_real_GetWindowSize(ame_primaryWindow, &sdlW, &sdlH) &&
+        sdlW > 0 && sdlH > 0 && width == sdlW && height == sdlH) {
+        *why = "SDL window points used as pixels";
+        return true;
+    }
+    // 候选三：SDL 自己换算的像素尺寸（points x UIScreen.scale）。
+    // SDL 不知道启动器的 resolutionScale，故只有 100% 时才与 surface 相等。
+    int pxW = 0, pxH = 0;
+    if (ame_primaryWindow != NULL && ame_real_GetWindowSizeInPixels != NULL &&
+        ame_real_GetWindowSizeInPixels(ame_primaryWindow, &pxW, &pxH) &&
+        pxW > 0 && pxH > 0 && width == pxW && height == pxH) {
+        *why = "SDL pixel size (ignores resolutionScale)";
+        return true;
+    }
+    return false;
+}
+
+// 主动解析真实 glViewport。MC 可能从未走过我们的包装路径（见 swap 处注释），
+// 那时 ame_real_glViewport 仍是 NULL，需自行 dlsym。
+// 渲染器以 RTLD_LOCAL 加载，故 dlsym(RTLD_DEFAULT) 可能取不到，
+// 必须优先从渲染器句柄取。
+static ame_fn_glViewport ame_resolve_glViewport(void) {
+    if (ame_real_glViewport != NULL) return ame_real_glViewport;
+    void *rh = ame_rendererHandle();
+    if (rh != NULL)
+        ame_real_glViewport = (ame_fn_glViewport)dlsym(rh, "glViewport");
+    if (ame_real_glViewport == NULL)
+        ame_real_glViewport = (ame_fn_glViewport)dlsym(RTLD_DEFAULT, "glViewport");
+    return ame_real_glViewport;
+}
+
+// 与 ame_maybeWrapEgl 平行，处理 gl* 入口。
+// 关键补充：SDL_EGL_GetProcAddress / SDL_LoadFunction 此前只包装 egl* 符号，
+// 而 LWJGL 的 EGL 后端正是从这两条路取 GL 函数 —— glViewport 从那里漏出，
+// 导致后部的包装从未被调用（日志里 glViewport 零输出即此证据）。
+static void ame_maybeWrapGl(const char *name, void **out) {
+    if (name == NULL || out == NULL || *out == NULL) return;
+    if (strcmp(name, "glViewport") != 0) return;
+    if (ame_real_glViewport == NULL) ame_real_glViewport = (ame_fn_glViewport)*out;
+    *out = (void *)ame_glViewport;
+}
+
 // 把原始指针换成代理。orig 为 NULL 时不覆盖（ZL2 语义：首次解析后固定）。
 static void ame_maybeWrapEgl(const char *name, void **out) {
     if (name == NULL || *out == NULL) return;
@@ -1044,6 +1115,7 @@ static void ame_SDL_DestroyWindow(void *window) {
 static void *ame_SDL_LoadFunction(void *handle, const char *name) {
     void *r = ame_real_LoadFunction ? ame_real_LoadFunction(handle, name) : NULL;
     ame_maybeWrapEgl(name, &r);
+    ame_maybeWrapGl(name, &r);
     return r;
 }
 
@@ -1052,6 +1124,7 @@ static void *ame_SDL_EGL_GetProcAddress(const char *proc) {
     void *r = ame_real_EGL_GetProcAddress ? ame_real_EGL_GetProcAddress(proc) : NULL;
     if (proc == NULL || r == NULL) return r;
     ame_maybeWrapEgl(proc, &r);
+    ame_maybeWrapGl(proc, &r);
     return r;
 }
 
@@ -1214,7 +1287,85 @@ static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
     return true;
 }
 
+// —— swap 前观测并修正实际生效的 viewport ——
+//
+// 上面的包装依赖 MC 恰好从我们接管过的路径取 glViewport。但观测表明它可能
+// 另有来源：SDL_GL_GetProcAddress 与 dlsym 两条路都已接管，日志里却一条
+// glViewport 都没有 —— 说明 MC 用了第三条路（已缓存的指针、或直接链接）。
+//
+// 与其继续猜，不如直接读 GL 状态机：glGetIntegerv(GL_VIEWPORT) 返回的是
+// 当前真正生效的值，无论 MC 从哪条路设置。这是唯一无法被绕过的观测点，
+// 它给出的数字能一次性区分两种情况：
+//   - 值是 320x480 / 812x375 等已知错误候选 → 渲染区域确实错了，在此修正；
+//   - 值已等于 EGL surface                 → 问题不在 viewport，需换方向。
+//
+// 判定仍只精确匹配已知错误候选（ame_viewportIsBad），不做比例推断。
+#define AME_GL_VIEWPORT 0x0BA2
+
+typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
+
+static ame_fn_glGetIntegerv ame_real_glGetIntegerv = NULL;
+static bool ame_glGetIntegervResolved = false;
+static int ame_swapViewportLogBudget = 8;
+
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void) {
+    if (ame_glGetIntegervResolved) return ame_real_glGetIntegerv;
+    ame_glGetIntegervResolved = true;
+    void *rh = ame_rendererHandle();
+    if (rh != NULL)
+        ame_real_glGetIntegerv = (ame_fn_glGetIntegerv)dlsym(rh, "glGetIntegerv");
+    if (ame_real_glGetIntegerv == NULL)
+        ame_real_glGetIntegerv =
+            (ame_fn_glGetIntegerv)dlsym(RTLD_DEFAULT, "glGetIntegerv");
+    NSDebugLog(@"[SDLHook] glGetIntegerv resolved=%p",
+               (void *)ame_real_glGetIntegerv);
+    return ame_real_glGetIntegerv;
+}
+
+static void ame_enforceViewportAtSwap(void) {
+    ame_fn_glGetIntegerv getIv = ame_resolve_glGetIntegerv();
+    if (getIv == NULL) return;
+
+    int eglW = 0, eglH = 0;
+    if (!ame_eglSurfacePixelSize(&eglW, &eglH)) return;
+
+    int32_t v[4] = {0, 0, 0, 0};
+    getIv(AME_GL_VIEWPORT, v);
+    int32_t vw = v[2];
+    int32_t vh = v[3];
+
+    const char *why = NULL;
+    bool bad = ame_viewportIsBad(vw, vh, eglW, eglH, &why);
+
+    if (ame_swapViewportLogBudget > 0) {
+        ame_swapViewportLogBudget--;
+        NSDebugLog(@"[SDLHook] swap viewport %dx%d (egl surface %dx%d, %s)",
+                   vw, vh, eglW, eglH, bad ? (why ? why : "bad") : "ok");
+    }
+
+    if (!bad) return;
+
+    // viewport 是 GL 状态，一经设置便持续生效。MC 若只在 resize 时设一次
+    // （现象上正是如此 —— 必须手动改分辨率才恢复），这里的修正就一直有效；
+    // 若它每帧重设，则此修正会被下一帧覆盖，但日志已给出真相，可据此
+    // 转而去修它的取值来源，而非继续在此兜底。
+    ame_fn_glViewport setVp = ame_resolve_glViewport();
+    if (setVp == NULL) {
+        if (ame_swapViewportLogBudget > 0) {
+            ame_swapViewportLogBudget--;
+            NSDebugLog(@"[SDLHook] swap viewport NOT fixed: glViewport unresolved");
+        }
+        return;
+    }
+    setVp(0, 0, (int32_t)eglW, (int32_t)eglH);
+    if (ame_swapViewportLogBudget > 0) {
+        ame_swapViewportLogBudget--;
+        NSDebugLog(@"[SDLHook] swap viewport forced -> %dx%d (%s)", eglW, eglH, why);
+    }
+}
+
 static bool ame_SDL_GL_SwapWindow(void *window) {
+    ame_enforceViewportAtSwap();
     pojavSwapBuffers();
     return true;
 }
@@ -1232,12 +1383,6 @@ static bool ame_SDL_GL_SwapWindow(void *window) {
 //
 // 判定刻意保守 —— 只精确匹配「已知的错误候选」，不做比例推断，以免误伤
 // 渲染到 FBO 时的合法小 viewport（阴影贴图、GUI 元素、缩略图等）。
-typedef void (*ame_fn_glViewport)(int32_t x, int32_t y,
-                                  int32_t width, int32_t height);
-
-static ame_fn_glViewport ame_real_glViewport = NULL;
-static int ame_glViewportLogBudget = 8;
-
 static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) {
     if (ame_real_glViewport == NULL) {
         return;
@@ -1246,36 +1391,10 @@ static void ame_glViewport(int32_t x, int32_t y, int32_t width, int32_t height) 
     int eglW = 0, eglH = 0;
     bool haveSurface = ame_eglSurfacePixelSize(&eglW, &eglH);
 
-    bool bad = false;
+    // 判定统一由 ame_viewportIsBad 承担：swap 前的观测走同一套候选，
+    // 避免两处逻辑各自漂移（见 ame_enforceViewportAtSwap 处注释）。
     const char *why = NULL;
-    int sdlW = 0, sdlH = 0;
-    int pxW = 0, pxH = 0;
-    if (haveSurface && width > 0 && height > 0 &&
-        (width != eglW || height != eglH)) {
-        // 候选一：MC 把 SDL 内部的 points 当成了像素
-        if (ame_primaryWindow != NULL && ame_real_GetWindowSize != NULL &&
-            ame_real_GetWindowSize(ame_primaryWindow, &sdlW, &sdlH) &&
-            sdlW > 0 && sdlH > 0 && width == sdlW && height == sdlH) {
-            bad = true;
-            why = "SDL window points used as pixels";
-        }
-        // 候选二：建窗阶段缓存的隐藏工具窗口尺寸
-        if (!bad && ((width == 320 && height == 480) ||
-                     (width == 480 && height == 320))) {
-            bad = true;
-            why = "hidden utility window size";
-        }
-        // 候选三：SDL 自己换算的像素尺寸（points x UIScreen.scale）。
-        // SDL 完全不知道启动器的 resolutionScale，故只有 100% 时才与
-        // EGL surface 相等 —— 这正是 75%/25% 下画面被裁/超出的来源。
-        if (!bad && ame_primaryWindow != NULL &&
-            ame_real_GetWindowSizeInPixels != NULL &&
-            ame_real_GetWindowSizeInPixels(ame_primaryWindow, &pxW, &pxH) &&
-            pxW > 0 && pxH > 0 && width == pxW && height == pxH) {
-            bad = true;
-            why = "SDL pixel size (ignores resolutionScale)";
-        }
-    }
+    bool bad = haveSurface ? ame_viewportIsBad(width, height, eglW, eglH, &why) : false;
 
     // 无条件记录前若干次：MC 实际设置的 viewport 是什么，是判断「小窗」成因的
     // 唯一直接证据。若这里打印的值已等于 EGL surface，问题就不在 viewport，
