@@ -1480,9 +1480,73 @@ static void *ame_SDL_GL_CreateContext(void *window) {
     return ctx;
 }
 
+// AME_GL_VIEWPORT 与两个 GL 入口点解析函数定义在文件后部，此处提前声明，
+// 以便 ame_applyViewportAfterMakeCurrent 在 MakeCurrent 路径上使用。
+#define AME_GL_VIEWPORT 0x0BA2
+
+typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
+
+static ame_fn_glViewport ame_resolve_glViewport(void);
+static ame_fn_glGetIntegerv ame_resolve_glGetIntegerv(void);
+
+// —— MakeCurrent 后立即把 viewport 对齐到 EGL surface ——
+//
+// swap 前那一层修正是「渲染之后」的兜底：第一帧已经用错误 viewport 画完，
+// 若 MC 每帧都重设错值，它就永远晚一帧。这里补上更早的一环 ——
+// 上下文刚 current、尚未有任何绘制时，直接把 viewport 设为 surface 尺寸。
+//
+// 此刻设 viewport 是安全的：viewport 是上下文级 GL 状态，与 FBO 绑定无关；
+// 且此时 MC 还没有任何渲染，不存在覆盖其合法设置的可能。之后 MC 若自行
+// 设为别的值，仍由 swap 前那层守护兜底，两道防线互不冲突。
+//
+// 采用无条件设置而非「先判坏再设」：判定函数 ame_viewportIsBad 会回调 SDL
+// 真实查询，而此刻 SDL 窗口状态可能尚未完成 resize，不如直接对齐 surface。
+static void ame_applyViewportAfterMakeCurrent(void) {
+    static bool appliedOnce = false;
+
+    int eglW = 0, eglH = 0;
+    if (!ame_eglSurfacePixelSize(&eglW, &eglH)) return;
+    if (eglW <= 0 || eglH <= 0) return;
+
+    ame_fn_glViewport setVp = ame_resolve_glViewport();
+    if (setVp == NULL) {
+        if (!appliedOnce) {
+            appliedOnce = true;
+            NSDebugLog(@"[SDLHook] MakeCurrent viewport NOT applied: glViewport unresolved");
+        }
+        return;
+    }
+
+    // 读一次改前值，仅用于日志判断这次修正是否真的有必要。
+    int32_t before[4] = {0, 0, 0, 0};
+    ame_fn_glGetIntegerv getIv = ame_resolve_glGetIntegerv();
+    if (getIv != NULL) {
+        getIv(AME_GL_VIEWPORT, before);
+    }
+
+    if ((int32_t)eglW == before[2] && (int32_t)eglH == before[3]) {
+        if (!appliedOnce) {
+            appliedOnce = true;
+            NSDebugLog(@"[SDLHook] MakeCurrent viewport already %dx%d (egl surface, ok)", eglW, eglH);
+        }
+        return;
+    }
+
+    setVp(0, 0, (int32_t)eglW, (int32_t)eglH);
+
+    if (!appliedOnce) {
+        appliedOnce = true;
+        NSDebugLog(@"[SDLHook] MakeCurrent viewport %dx%d -> %dx%d (aligned to EGL surface)",
+                   before[2], before[3], eglW, eglH);
+    }
+}
+
 static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
     if (context != NULL) g_glContext = context;
     pojavMakeCurrent(context);
+    // 上下文刚 current、尚未绘制：把 viewport 对齐到 EGL surface，
+    // 消除「swap 前修正永远晚一帧」的结构性缺陷（见上方函数注释）。
+    ame_applyViewportAfterMakeCurrent();
     NSDebugLog(@"[SDLHook] SDL_GL_MakeCurrent(%p, %p) -> EGL bridge", window, context);
     return true;
 }
@@ -1500,10 +1564,6 @@ static bool ame_SDL_GL_MakeCurrent(void *window, void *context) {
 //   - 值已等于 EGL surface                 → 问题不在 viewport，需换方向。
 //
 // 判定仍只精确匹配已知错误候选（ame_viewportIsBad），不做比例推断。
-#define AME_GL_VIEWPORT 0x0BA2
-
-typedef void (*ame_fn_glGetIntegerv)(uint32_t pname, int32_t *params);
-
 static ame_fn_glGetIntegerv ame_real_glGetIntegerv = NULL;
 static bool ame_glGetIntegervResolved = false;
 static int ame_swapViewportLogBudget = 8;
