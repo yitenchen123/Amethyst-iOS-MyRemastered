@@ -341,11 +341,14 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         @{@"key": @ RENDERER_NAME_VULKAN,
           @"name": localize(@"preference.title.renderer.debug.vulkan", nil),
           @"file": @ RENDERER_NAME_VULKAN},
-        // Mithril (libmithril.dylib) 入口已停用：MobileGL 已可正常工作，
-        // 不再需要维护 Mithril 这条转译路径（其 dylib 需单独预编译）。
-        // @{@"key": @ RENDERER_NAME_MITHRIL,
-        //   @"name": localize(@"preference.title.renderer.debug.mithril", nil),
-        //   @"file": @ RENDERER_NAME_MITHRIL},
+        // Mithril（libmithril.dylib）：自带 EGL 与 desktop GL，经 Vulkan/MoltenVK 到 Metal
+        // （utils.h: isSelfEglRenderer / isDesktopGLRenderer 已覆盖它）。
+        // dylib 已内置在 Natives/resources/Frameworks/ 下随包分发，无需 CI 额外编译。
+        // 位置刻意保持在 RENDERER_NAME_VULKAN 之后、MOBILEGL 之前：pick 控件按下标配对，
+        // 换位置会让已存 profile 里的 renderer 值显示错位。
+        @{@"key": @ RENDERER_NAME_MITHRIL,
+          @"name": localize(@"preference.title.renderer.debug.mithril", nil),
+          @"file": @ RENDERER_NAME_MITHRIL},
         @{@"key": @ RENDERER_NAME_MOBILEGL,
           @"name": localize(@"preference.title.renderer.debug.mobilegl", nil),
           @"file": @ RENDERER_NAME_MOBILEGL},
