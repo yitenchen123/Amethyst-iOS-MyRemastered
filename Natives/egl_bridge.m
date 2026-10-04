@@ -19,6 +19,43 @@
 #include "ctxbridges/osmesa_internal.h"
 #include "utils.h"
 
+#include <unistd.h>
+
+/* ---------------------------------------------------------------------------
+ * 前后台 GPU 访问门 —— 修「切后台再切回前台卡死」。
+ *
+ * 病历：iOS 在 App 后台化之后禁止任何 GPU 访问，而 MC 的渲染线程并不知情，
+ * 它每帧照常走 LWJGL glfwSwapBuffers -> pojavSwapBuffers -> eglSwapBuffers。
+ * 后台期间这次调用会阻塞在 Metal 的 present / nextDrawable 上（命令队列已被
+ * 系统挂起），且该阻塞在切回前台之后也不会自然解除 —— 渲染线程永久停在
+ * swap 里，进程活着但画面冻结，即用户看到的「切后台再回来卡死」。
+ *
+ * 修法：进入后台后直接掐断 swap，渲染线程不再触碰 GPU，只做节流空转；
+ * 回到前台立即恢复。pojavSwapBuffers 是所有走 bridge_tbl 的后端
+ * （gl4es / NG-GL4ES / MobileGL / ANGLE / zink-OSMesa）的公共出口，
+ * 故一处生效、全后端通吃。
+ * ------------------------------------------------------------------------- */
+static volatile BOOL g_pojavAppBackgrounded = NO;
+static NSTimeInterval g_pojavBackgroundedAt = 0;
+
+void pojavSetAppBackgrounded(BOOL backgrounded) {
+    BOOL was = g_pojavAppBackgrounded;
+    if (was == backgrounded) return;   /* 幂等：resignActive/enterBackground 会重复调用 */
+    if (backgrounded) {
+        g_pojavBackgroundedAt = [NSDate date].timeIntervalSince1970;
+        g_pojavAppBackgrounded = YES;
+        NSLog(@"[Lifecycle] backgrounded -- swap/present gated OFF (iOS forbids GPU access once backgrounded)");
+    } else {
+        g_pojavAppBackgrounded = NO;
+        NSTimeInterval gated = [NSDate date].timeIntervalSince1970 - g_pojavBackgroundedAt;
+        NSLog(@"[Lifecycle] foregrounded -- swap/present restored (gated %.2fs)", gated);
+    }
+}
+
+BOOL pojavIsAppBackgrounded(void) {
+    return g_pojavAppBackgrounded;
+}
+
 int clientAPI;
 
 void JNI_LWJGL_changeRenderer(const char* value_c) {
@@ -94,6 +131,16 @@ void pojavSetWindowHint(int hint, int value) {
 }
 
 void pojavSwapBuffers() {
+    if (g_pojavAppBackgrounded) {
+        /* 见 g_pojavAppBackgrounded 处的说明：后台绝不触碰 GPU。
+           20Hz 节流空转，避免烧 CPU；回到前台后下一帧即恢复正常 swap。 */
+        static int bgSkipped = 0;
+        if (++bgSkipped == 1 || (bgSkipped % 100) == 0) {
+            NSLog(@"[Lifecycle] swap skipped while backgrounded (%d frames)", bgSkipped);
+        }
+        usleep(50 * 1000);
+        return;
+    }
     br_swap_buffers();
 }
 
