@@ -448,9 +448,65 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
                   @"(glslang symbols isolated from libshaderc.dylib)", renderer);
         }
         dlopen(rpath.UTF8String, dlFlags);
+
+        // Kopper Zink: load the gallium driver explicitly with RTLD_GLOBAL.
+        // The renderer image is a small re-export stub (LC_REEXPORT_DYLIB) that
+        // forwards both Mesa's EGL entry points and the GL driver; if dyld
+        // cannot resolve the libraries it points at, dlsym on it yields NULL
+        // and the first GL call jumps to 0x0. Loading the driver itself puts
+        // the gl* symbols into the global symbol table regardless, so LWJGL's
+        // lookup succeeds either way.
+        if (isKopperZinkRenderer(renderer.UTF8String)) {
+            void *driver = dlopen("@rpath/libgallium-26.3.0-devel.dylib",
+                                  RTLD_NOW | RTLD_GLOBAL);
+            NSLog(@"[egl_bridge] Kopper Zink: explicit driver preload -> %p%s",
+                  driver ?: NULL, driver == NULL ? " (FAILED)" : "");
+            if (driver == NULL)
+                NSLog(@"[egl_bridge] Kopper Zink driver dlopen error: %s", dlerror() ?: "?");
+        }
+
+        // Diagnostic: a re-export stub (LC_REEXPORT_DYLIB) only yields symbols
+        // when dyld resolved the libraries it points at. If it did not, dlsym
+        // returns NULL and an unguarded call jumps to 0x0. Print the handles so
+        // a failed stub is visible instead of presenting as a bare SIGSEGV.
+        {
+            void *h = dlopen(rpath.UTF8String, RTLD_LAZY | RTLD_NOLOAD);
+            if (h != NULL) {
+                const char *probeNames[] = {
+                    "eglGetDisplay", "eglGetPlatformDisplay", "eglInitialize",
+                    "eglChooseConfig", "eglCreateWindowSurface", "eglMakeCurrent",
+                    "eglSwapBuffers", "glGetString", "glCreateShader",
+                };
+                for (size_t pi = 0; pi < sizeof(probeNames) / sizeof(probeNames[0]); pi++) {
+                    void *sym = dlsym(h, probeNames[pi]);
+                    NSLog(@"[egl_bridge] symbol probe %s = %p%@", probeNames[pi], sym,
+                          sym == NULL ? @" (UNRESOLVED)" : @"");
+                }
+            } else {
+                NSLog(@"[egl_bridge] symbol probe skipped: RTLD_NOLOAD dlopen failed (%s)",
+                      dlerror() ?: "no error");
+            }
+        }
     }
 
-    return pojavFinishOpenGLInit(!br_init());
+    // bridge_tbl.h leaves br_init/br_init_context as NULL until a
+    // set_*_bridge_tbl() runs. A missing dispatch shows up on device as
+    // "SIGSEGV at pc=0x0" inside this function, with MC's log buffer losing
+    // the evidence - so check explicitly and report which case it is.
+    if (br_init == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init is NULL for renderer=%@ "
+              @"(no bridge table was selected -- renderer name not matched "
+              @"by any branch in pojavInitOpenGLInternal)", renderer);
+        return pojavFinishOpenGLInit(1);
+    }
+    if (br_init_context == NULL) {
+        NSLog(@"[egl_bridge] FATAL: br_init_context is NULL for renderer=%@", renderer);
+        return pojavFinishOpenGLInit(1);
+    }
+
+    int brInitResult = br_init();
+    NSLog(@"[egl_bridge] br_init() returned %d for renderer=%@", brInitResult, renderer);
+    return pojavFinishOpenGLInit(!brInitResult);
     //return 0;
 }
 

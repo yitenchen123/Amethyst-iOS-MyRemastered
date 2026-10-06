@@ -1660,8 +1660,18 @@ static bool gl_init() {
         }
         NSLog(@"EGLBridge: Kopper Zink display via EGL_PLATFORM_IOS_MESA "
               @"(layer %p)", nativeWindow);
-    } else {
+    } else if (handle.eglGetDisplay != NULL) {
         g_EglDisplay = handle.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    } else {
+        /* dlsym_EGL() checks a required set of entry points, but re-read the
+         * pointer here rather than assuming: on a re-export stub image a
+         * failed library resolution leaves symbols NULL, and calling one is
+         * an immediate jump to 0x0 with no diagnostic. */
+        NSLog(@"EGLBridge: eglGetDisplay unresolved in the renderer image "
+              @"(renderer=%s) -- cannot create a display; is the dylib a "
+              @"re-export stub whose dependencies failed to load?",
+              renderer ?: "<unset>");
+        return false;
     }
     if (g_EglDisplay == EGL_NO_DISPLAY) {
         NSDebugLog(@"EGLBridge: eglGetDisplay(EGL_DEFAULT_DISPLAY) returned EGL_NO_DISPLAY");
