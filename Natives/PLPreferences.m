@@ -36,6 +36,10 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
     NSMutableDictionary<NSString *, NSMutableDictionary *> *defaults = @{
         @"general": @{
             @"check_sha": @YES,
+            // 启动时自动检查更新。必须在此注册：键不存在时 PLPreferences 的
+            // setter 会静默失败，用户关掉开关也存不住，下次启动又会被
+            // +autoCheckEnabled 当作"缺省"写回 @YES（本仓已知的坑）。
+            @"auto_check_update": @YES,
             @"cosmetica": @YES,
             @"debug_logging": @(!CONFIG_RELEASE),
             @"news_url": @"https://air-api.vercel.app/api/announcements.php",
@@ -503,11 +507,16 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
 }
 
 - (BOOL)setObject:(NSString *)key value:(id)value {
-    if ([self.instancePref valueForKeyPath:key]) {
+    /* Presence must be tested with an explicit nil check, not truthiness:
+     * a stored @NO is non-nil but falsy, so `if ([... valueForKeyPath:key])`
+     * silently dropped every write that tried to store a boolean OFF -
+     * which is why switches backed by boolean prefs could be turned on but
+     * never off (see general.auto_check_update). */
+    if ([self.instancePref valueForKeyPath:key] != nil) {
         [self.instancePref setValue:value forKeyPath:key];
         [self saveInstancePref];
         return YES;
-    } else if ([self.globalPref valueForKeyPath:key]) {
+    } else if ([self.globalPref valueForKeyPath:key] != nil) {
         [self.globalPref setValue:value forKeyPath:key];
         [self saveGlobalPref];
         return YES;
