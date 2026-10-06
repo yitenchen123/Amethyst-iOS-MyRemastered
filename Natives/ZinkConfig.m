@@ -328,12 +328,13 @@ static AppleGPUGeneration _cachedGPUGeneration = AppleGPUGenerationUnknown;
     // CAMetalLayer-backed Vulkan swapchain. When enabled, Mesa's
     // flush_front presents and skips its CPU readback, and the launcher's
     // OSMesa bridge stops uploading CGImages - that pair of copies is the
-    // GPU->CPU->GPU round trip kopper removes. Set zink.kopper=1 to try it;
-    // leave it off to keep the proven OSMesa readback path.
-    id kopperPref = getPrefObject(@"zink.kopper");
+    // GPU->CPU->GPU round trip kopper removes. Toggled from the launcher's
+    // Video settings ("Kopper 直显", video.kopper); leave it off to keep the
+    // proven OSMesa readback path.
+    id kopperPref = getPrefObject(@"video.kopper");
     if (kopperPref && [kopperPref boolValue]) {
         setenv("AMETHYST_KOPPER_PRESENT", "1", 1);
-        NSLog(@"[ZinkConfig] Kopper unilateral present requested (zink.kopper=1)");
+        NSLog(@"[ZinkConfig] Kopper unilateral present requested (video.kopper=1)");
     } else {
         unsetenv("AMETHYST_KOPPER_PRESENT");
     }

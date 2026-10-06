@@ -99,7 +99,12 @@ NSString *const PREF_MOD_MIRROR = @"general.mod_mirror";
             // 键必须在此注册：否则 PLPreferences 的 getter/setter 因键不存在而静默
             // 失败（日志刷 "could not find preference video.sfpew_overlay"），
             // 设置页开关既读不出也存不下。
-            @"sfpew_overlay": @NO
+            @"sfpew_overlay": @NO,
+            // iOS Kopper 直显（实验）：zink 渲染器下让 Mesa 直接 present 到
+            // CAMetalLayer 的 Vulkan swapchain，跳过每帧 CPU 回读 + CGImage
+            // 上传（OSMesa 离屏链路的主要开销）。默认关闭。
+            // 键必须在此注册，否则设置页开关存不下（见 setObject 的说明）。
+            @"kopper": @NO
         }.mutableCopy,
         @"control": @{
             @"default_ctrl": @"default.json",

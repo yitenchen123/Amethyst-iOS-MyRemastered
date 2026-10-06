@@ -811,6 +811,16 @@
               @"pickKeys": self.rendererKeys,
               @"pickList": self.rendererList
             },
+            // Kopper 直显（实验）：zink 渲染器下让 Mesa 直接呈现到
+            // CAMetalLayer 的 Vulkan swapchain，跳过每帧 GPU->CPU 回读 +
+            // CGImage 上传（即 OSMesa 离屏链路的主要开销）。
+            // 默认关闭：关掉即回到已验证的 OSMesa 离屏路径。
+            @{@"key": @"kopper",
+              @"hasDetail": @YES,
+              @"icon": @"bolt.horizontal.circle",
+              @"type": self.typeSwitch,
+              @"enableCondition": whenNotInGame
+            },
             // SimpleFPEWrapper 固定管线 (GL 1.x) 仿真层，仅叠加在 GLES 后端之上
             // （MobileGlues / MobileGL-gles）；gl4es、zink、Vulkan 等不适用。
             @{@"key": @"sfpew_overlay",
