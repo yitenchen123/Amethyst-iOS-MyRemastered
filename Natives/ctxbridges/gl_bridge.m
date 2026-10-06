@@ -1624,12 +1624,45 @@ static BOOL ame_mgBootstrap(EGLDisplay dpy, EGLConfig config) {
     return YES;
 }
 
+// Mesa's iOS platform enum. Defined in include/EGL/eglext.h as
+// EGL_MESA_platform_ios; repeated here so this file builds against whatever
+// EGL headers the renderer chosen happens to provide.
+#ifndef EGL_PLATFORM_IOS_MESA
+#define EGL_PLATFORM_IOS_MESA 0x31E0
+#endif
+
 static bool gl_init() {
     if (!dlsym_EGL()) {
         return false;
     }
 
-    g_EglDisplay = handle.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    // Kopper Zink: Mesa's iOS platform layer is only reachable through
+    // eglGetPlatformDisplay(EGL_PLATFORM_IOS_MESA, CAMetalLayer*, NULL) --
+    // _eglGetIosDisplay() rejects a NULL native_display, and that layer is
+    // what kopper turns into its VkSurfaceKHR. GameSurfaceView is already
+    // CAMetalLayer-backed and exists by now (viewDidLoad runs before the JVM
+    // launch), so we can hand it over here.
+    const char *renderer = getenv("AMETHYST_RENDERER");
+    if (isKopperZinkRenderer(renderer) && handle.eglGetPlatformDisplay != NULL) {
+        void *nativeWindow = (__bridge void *)SurfaceViewController.surface.layer;
+        if (nativeWindow == NULL) {
+            NSLog(@"EGLBridge: Kopper Zink selected but the surface layer is NULL; "
+                  @"cannot create the iOS platform display");
+            return false;
+        }
+        g_EglDisplay = handle.eglGetPlatformDisplay(EGL_PLATFORM_IOS_MESA,
+                                                    nativeWindow, NULL);
+        if (g_EglDisplay == EGL_NO_DISPLAY) {
+            NSLog(@"EGLBridge: eglGetPlatformDisplay(EGL_PLATFORM_IOS_MESA, %p) "
+                  @"failed: 0x%x", nativeWindow,
+                  (unsigned int)(uintptr_t)handle.eglGetError());
+            return false;
+        }
+        NSLog(@"EGLBridge: Kopper Zink display via EGL_PLATFORM_IOS_MESA "
+              @"(layer %p)", nativeWindow);
+    } else {
+        g_EglDisplay = handle.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    }
     if (g_EglDisplay == EGL_NO_DISPLAY) {
         NSDebugLog(@"EGLBridge: eglGetDisplay(EGL_DEFAULT_DISPLAY) returned EGL_NO_DISPLAY");
         return false;

@@ -40,6 +40,10 @@
 #define RENDERER_NAME_MTL_ANGLE "libtinygl4angle.dylib"
 #define RENDERER_NAME_MOBILEGLUES "libmobileglues.dylib"
 #define RENDERER_NAME_VK_ZINK "libOSMesa.8.dylib"
+/* Kopper Zink: real EGL present path. Mesa's libEGL is the entry point; it
+ * loads @rpath/libgallium-26.3.0-devel.dylib (which contains zink + kopper)
+ * by itself, so both files must ship together in Frameworks/. */
+#define RENDERER_NAME_KOPPER_ZINK "libEGL.dylib"
 #define RENDERER_NAME_VULKAN "libMoltenVK.dylib"
 // LTW (Large Thin Wrapper) - OpenGL Core 3.3 → OpenGL ES 3 转译层
 // 复刻自官方 MojoLauncher/LTW 仓库，完美支持 Sodium + Iris 光影：
@@ -131,14 +135,23 @@ static inline bool isMithrilRenderer(const char *renderer) {
 }
 
 // 自带 EGL 实现的渲染器：EGL 符号要从渲染器自己的 dylib 解析，不能用 ANGLE。
+// Kopper Zink（libEGL.dylib）：Mesa 自带的 EGL 实现，EGL 符号必须从它
+// 自己解析，不能落到 ANGLE —— 否则拿到的还是 ANGLE 的 Metal 上下文，
+// Mesa 的 iOS 平台层（EGL_PLATFORM_IOS_MESA）根本不会被触达。
+static inline bool isKopperZinkRenderer(const char *renderer) {
+    return renderer && !strcmp(renderer, RENDERER_NAME_KOPPER_ZINK);
+}
+
 static inline bool isSelfEglRenderer(const char *renderer) {
-    return isMithrilRenderer(renderer) || isMobileGLRenderer(renderer);
+    return isMithrilRenderer(renderer) || isMobileGLRenderer(renderer) ||
+           isKopperZinkRenderer(renderer);
 }
 
 // 导出 desktop OpenGL（而非 OpenGL ES）的渲染器：
 // 需要 EGL_OPENGL_BIT 配置 + eglBindAPI(EGL_OPENGL_API)。
 static inline bool isDesktopGLRenderer(const char *renderer) {
     return isMobileGLRenderer(renderer) || isMithrilRenderer(renderer) ||
+           isKopperZinkRenderer(renderer) ||
            (renderer && !strcmp(renderer, RENDERER_NAME_MTL_ANGLE));
 }
 

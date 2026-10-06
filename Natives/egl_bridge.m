@@ -323,6 +323,20 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         NSLog(@"[egl_bridge] MobileGL renderer: backend=%s",
             getenv("MOBILEGL_BACKEND_TYPE") ?: "<unset>");
         set_gl_bridge_tbl();
+    } else if (isKopperZinkRenderer(renderer.UTF8String)) {
+        // Kopper Zink（libEGL.dylib）：真 EGL 直显路径，对齐安卓的 zink+kopper。
+        //
+        // 与 Vulkan Zink（libOSMesa.8.dylib 走 osm_bridge 离屏回读）相对：
+        // 这里由 Mesa 的 libEGL 从 CAMetalLayer 建 iOS 平台 display，
+        // kopper 把 swapchain 映像交给 zink 作渲染目标，eglSwapBuffers 直接
+        // present —— 没有 GPU→CPU 回读，也没有 CGImage 上传。
+        //
+        // 必须排在 libOSMesa 前缀分支之前（两者文件名不同，此处仍显式前置，
+        // 避免日后命名变化被前缀分支吞掉）。
+        setenv("GALLIUM_DRIVER", "zink", 1);
+        NSLog(@"[egl_bridge] Kopper Zink renderer: real EGL path via libEGL.dylib "
+              @"(EGL_PLATFORM_IOS_MESA -> zink kopper -> CAMetalLayer present)");
+        set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"] && !isVirglRenderer(renderer.UTF8String)) {
         // ★ [RENDERER-GAP] 排除 libOSMesaVirgl.dylib（VirGL 已在上面单独分支处理，
         // 其 GALLIUM_DRIVER=virgl 由 ame_gap_virgl_boot 设置，不能被 zink 覆盖）。
