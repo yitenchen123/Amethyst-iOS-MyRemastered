@@ -314,8 +314,29 @@ static AppleGPUGeneration _cachedGPUGeneration = AppleGPUGenerationUnknown;
             break;
     }
 
-    setenv("MESA_GL_VERSION_OVERRIDE", "4.1", 1);
-    setenv("MESA_GLSL_VERSION_OVERRIDE", "410", 1);
+    // iOS Kopper: raise the GL cap from 4.1 to 4.6. The 4.1 ceiling was a
+    // launcher-side choice, not a Mesa/MoltenVK limit: zink derives its GL
+    // level from the Vulkan version MoltenVK advertises (1.4.357 with
+    // MoltenVK 1.4.2) and meson hard-codes glsl_feature_level=460. Anything
+    // Metal cannot actually back (transform feedback, ...) stays masked by
+    // the driver's real caps and by the extension overrides below.
+    // Users can still pin an older level via zink.gl_override.
+    setenv("MESA_GL_VERSION_OVERRIDE", "4.6", 1);
+    setenv("MESA_GLSL_VERSION_OVERRIDE", "460", 1);
+
+    // iOS Kopper: opt-in (default OFF) unilateral present straight to the
+    // CAMetalLayer-backed Vulkan swapchain. When enabled, Mesa's
+    // flush_front presents and skips its CPU readback, and the launcher's
+    // OSMesa bridge stops uploading CGImages - that pair of copies is the
+    // GPU->CPU->GPU round trip kopper removes. Set zink.kopper=1 to try it;
+    // leave it off to keep the proven OSMesa readback path.
+    id kopperPref = getPrefObject(@"zink.kopper");
+    if (kopperPref && [kopperPref boolValue]) {
+        setenv("AMETHYST_KOPPER_PRESENT", "1", 1);
+        NSLog(@"[ZinkConfig] Kopper unilateral present requested (zink.kopper=1)");
+    } else {
+        unsetenv("AMETHYST_KOPPER_PRESENT");
+    }
 
     // 仅当用户显式设置 zink.api_features 时才覆盖扩展列表，
     // applyZinkEnvironmentFromPreferences 会处理此情况。
@@ -386,7 +407,7 @@ static AppleGPUGeneration _cachedGPUGeneration = AppleGPUGenerationUnknown;
 
     id glOverride = getPrefObject(@"zink.gl_override");
     NSString *glVer = (glOverride && [glOverride isKindOfClass:[NSString class]] && [glOverride length] > 0 && ![(NSString *)glOverride isEqualToString:@"0"])
-        ? (NSString *)glOverride : @"4.1 (from level)";
+        ? (NSString *)glOverride : @"4.6 (from level)";
 
     id glThread = getPrefObject(@"zink.enable_gl_thread");
     NSString *glThreadStr = glThread ? ([glThread boolValue] ? @"YES" : @"NO") : @"YES";
@@ -458,6 +479,21 @@ static AppleGPUGeneration _cachedGPUGeneration = AppleGPUGenerationUnknown;
         } else if ([verStr isEqualToString:@"4.1"]) {
             setenv("MESA_GL_VERSION_OVERRIDE", "4.1", 1);
             setenv("MESA_GLSL_VERSION_OVERRIDE", "410", 1);
+        } else if ([verStr isEqualToString:@"4.2"]) {
+            setenv("MESA_GL_VERSION_OVERRIDE", "4.2", 1);
+            setenv("MESA_GLSL_VERSION_OVERRIDE", "420", 1);
+        } else if ([verStr isEqualToString:@"4.3"]) {
+            setenv("MESA_GL_VERSION_OVERRIDE", "4.3", 1);
+            setenv("MESA_GLSL_VERSION_OVERRIDE", "430", 1);
+        } else if ([verStr isEqualToString:@"4.4"]) {
+            setenv("MESA_GL_VERSION_OVERRIDE", "4.4", 1);
+            setenv("MESA_GLSL_VERSION_OVERRIDE", "440", 1);
+        } else if ([verStr isEqualToString:@"4.5"]) {
+            setenv("MESA_GL_VERSION_OVERRIDE", "4.5", 1);
+            setenv("MESA_GLSL_VERSION_OVERRIDE", "450", 1);
+        } else if ([verStr isEqualToString:@"4.6"]) {
+            setenv("MESA_GL_VERSION_OVERRIDE", "4.6", 1);
+            setenv("MESA_GLSL_VERSION_OVERRIDE", "460", 1);
         }
     }
 

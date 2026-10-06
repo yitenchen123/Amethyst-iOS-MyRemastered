@@ -11,6 +11,12 @@
 
 static osmesa_library handle;
 
+/* Kopper: present straight to the CAMetalLayer instead of the CPU readback. */
+static void (*osmesa_kopper_set_layer)(void *) = NULL;
+static void *(*osmesa_kopper_find_layer)(void) = NULL;
+static BOOL kopperActive = NO;
+static BOOL kopperLayerSet = NO;
+
 void dlsym_OSMesa() {
     void* dl_handle = dlopen([NSString stringWithFormat:@"@rpath/%s", getenv("AMETHYST_RENDERER")].UTF8String, RTLD_GLOBAL);
     assert(dl_handle);
@@ -22,11 +28,31 @@ void dlsym_OSMesa() {
     handle.glGetString = dlsym(dl_handle,"glGetString");
     handle.glClearColor = dlsym(dl_handle, "glClearColor");
     handle.glClear = dlsym(dl_handle,"glClear");
-    handle.glFinish = dlsym(dl_handle,"glFinish");
+    handle.glFinish = dlsym(dl_handle, "glFinish");
+
+    /* Optional Kopper hooks (present straight to the CAMetalLayer). */
+    osmesa_kopper_set_layer = dlsym(dl_handle, "osmesa_kopper_set_layer");
+    osmesa_kopper_find_layer = dlsym(dl_handle, "osmesa_kopper_find_layer");
+    NSLog(@"OSMBridge: kopper hooks set_layer=%p find_layer=%p",
+          osmesa_kopper_set_layer, osmesa_kopper_find_layer);
 }
 
 bool osm_init() {
     dlsym_OSMesa();
+
+    /* AMETHYST_KOPPER_PRESENT=1 lets Mesa present straight to the layer's
+     * Vulkan swapchain and skip the readback. Only engage it when the dylib
+     * actually exports the hooks, otherwise we would blank the screen. */
+    const char *kopperEnv = getenv("AMETHYST_KOPPER_PRESENT");
+    if (kopperEnv && kopperEnv[0] && kopperEnv[0] != '0' &&
+        osmesa_kopper_set_layer != NULL) {
+        kopperActive = YES;
+        NSLog(@"OSMBridge: Kopper unilateral present ENABLED");
+    } else {
+        kopperActive = NO;
+        NSLog(@"OSMBridge: Kopper disabled (env=%s hooks=%p)",
+              kopperEnv ? kopperEnv : "(unset)", osmesa_kopper_set_layer);
+    }
     return true; // no more specific initialization required
 }
 
@@ -76,6 +102,28 @@ void osm_make_current(osm_render_window_t* bundle) {
 
 void osm_swap_buffers() {
     osm_apply_current_ll();
+
+    if (kopperActive && osmesa_kopper_set_layer != NULL) {
+        /* kopperActive is only set once the dylib exports the hooks, so this
+         * is safe to call from the render thread: Mesa guards the layer
+         * handoff internally, and a NULL layer just clears it. */
+        if (!kopperLayerSet) {
+            void *layer = (__bridge void *)SurfaceViewController.surface.layer;
+            if (layer != NULL) {
+                osmesa_kopper_set_layer(layer);
+                kopperLayerSet = YES;
+                NSLog(@"OSMBridge: handed CAMetalLayer %p to Mesa", layer);
+            }
+        }
+        if (kopperLayerSet) {
+            /* Mesa's flush_front does the present (and skips its readback),
+             * driven by glFinish below. No CGImage upload: that round trip
+             * is exactly what kopper removes. */
+            handle.glFinish();
+            return;
+        }
+    }
+
     handle.glFinish(); // this will force osmesa to write the last rendered image into the buffer
     osm_render_window_t bundle = currentBundle->osm;
     dispatch_async(dispatch_get_main_queue(), ^{
