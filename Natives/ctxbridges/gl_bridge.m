@@ -1720,6 +1720,22 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
     }
     BOOL mobileGL = isMobileGLRenderer(apiRenderer);
 
+    // Kopper Zink: Mesa's iOS platform registers its configs with WINDOW_BIT
+    // only (platform_ios.c dri2_ios_add_configs_for_visuals), and
+    // eglChooseConfig needs the request to be a subset of the config's surface
+    // type -- asking for PBUFFER_BIT as well matched nothing and left
+    // bundle->config NULL. The kopper present path only needs a window
+    // surface, so skip the pbuffer bit for this renderer.
+    const EGLint kopperAttribs[] = {
+        EGL_RED_SIZE, 8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE, 8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_DEPTH_SIZE, 24,
+        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, desktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
+        EGL_NONE
+    };
     const EGLint attribs[] = {
         EGL_RED_SIZE, 8,
         EGL_GREEN_SIZE, 8,
@@ -1730,16 +1746,31 @@ gl_render_window_t* gl_init_context(gl_render_window_t *share) {
         EGL_RENDERABLE_TYPE, desktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT,
         EGL_NONE
     };
+    const BOOL kopperZink = isKopperZinkRenderer(apiRenderer);
+    const EGLint *chooseAttribs = kopperZink ? kopperAttribs : attribs;
 
     EGLint num_configs;
     EGLint vid;
-    if (!handle.eglChooseConfig(g_EglDisplay, attribs, &bundle->config, 1, &num_configs)) {
-        NSDebugLog(@"EGLBridge: Error couldn't get an EGL visual config: 0x%x", handle.eglGetError());
+    bundle->config = NULL;
+    num_configs = 0;
+    if (!handle.eglChooseConfig(g_EglDisplay, chooseAttribs, &bundle->config, 1, &num_configs)) {
+        NSLog(@"EGLBridge: eglChooseConfig failed: 0x%x (renderer=%s, surfaceType=%s)",
+              handle.eglGetError(), apiRenderer ?: "?",
+              kopperZink ? "WINDOW" : "WINDOW|PBUFFER");
         free(bundle);
         return NULL;
     }
-    assert(bundle->config);
-    assert(num_configs > 0);
+    // Report instead of asserting: a config mismatch used to abort the whole
+    // process with no explanation in release logs.
+    if (bundle->config == NULL || num_configs < 1) {
+        NSLog(@"EGLBridge: eglChooseConfig returned %d configs (renderer=%s, "
+              @"surfaceType=%s, renderableType=0x%x) -- no usable match",
+              (int)num_configs, apiRenderer ?: "?",
+              kopperZink ? "WINDOW" : "WINDOW|PBUFFER",
+              (unsigned)(desktopGL ? EGL_OPENGL_BIT : EGL_OPENGL_ES3_BIT));
+        free(bundle);
+        return NULL;
+    }
 
     if (!handle.eglGetConfigAttrib(g_EglDisplay, bundle->config, EGL_NATIVE_VISUAL_ID, &vid)) {
         NSDebugLog(@"EGLBridge: Error eglGetConfigAttrib() failed: 0x%x", handle.eglGetError());
