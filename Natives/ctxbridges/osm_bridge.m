@@ -14,6 +14,7 @@ static osmesa_library handle;
 /* Kopper: present straight to the CAMetalLayer instead of the CPU readback. */
 static void (*osmesa_kopper_set_layer)(void *) = NULL;
 static void *(*osmesa_kopper_find_layer)(void) = NULL;
+static BOOL (*osmesa_kopper_present_ok_get)(void) = NULL;
 static BOOL kopperActive = NO;
 static BOOL kopperLayerSet = NO;
 
@@ -33,6 +34,7 @@ void dlsym_OSMesa() {
     /* Optional Kopper hooks (present straight to the CAMetalLayer). */
     osmesa_kopper_set_layer = dlsym(dl_handle, "osmesa_kopper_set_layer");
     osmesa_kopper_find_layer = dlsym(dl_handle, "osmesa_kopper_find_layer");
+    osmesa_kopper_present_ok_get = dlsym(dl_handle, "osmesa_kopper_present_ok_get");
     NSLog(@"OSMBridge: kopper hooks set_layer=%p find_layer=%p",
           osmesa_kopper_set_layer, osmesa_kopper_find_layer);
 }
@@ -116,11 +118,22 @@ void osm_swap_buffers() {
             }
         }
         if (kopperLayerSet) {
-            /* Mesa's flush_front does the present (and skips its readback),
-             * driven by glFinish below. No CGImage upload: that round trip
-             * is exactly what kopper removes. */
+            /* glFinish drives Mesa's flush_front, which presents through
+             * kopper when it can. Only skip the CGImage upload if it
+             * actually did - otherwise the frame would never reach the
+             * screen (the readback went into the CPU buffer and nothing
+             * displays it). */
             handle.glFinish();
-            return;
+            BOOL presented = osmesa_kopper_present_ok_get
+                ? osmesa_kopper_present_ok_get() : YES;
+            static BOOL warnedNoPresent = NO;
+            if (!presented && !warnedNoPresent) {
+                warnedNoPresent = YES;
+                NSLog(@"OSMBridge: kopper did not present (falling back to "
+                      @"CGImage upload; is the swapchain format usable?)");
+            }
+            if (presented)
+                return;
         }
     }
 
