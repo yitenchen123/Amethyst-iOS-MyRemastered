@@ -42,15 +42,22 @@
 #define RENDERER_NAME_VK_ZINK "libOSMesa.8.dylib"
 /* Kopper Zink: real EGL present path.
  *
- * The entry point is libEGLkopper.dylib, a merged image that re-exports both
- * Mesa's EGL entry points and the gallium driver. It has to be one image:
- * LWJGL is handed this filename as org.lwjgl.opengl.libname and resolves every
- * gl* symbol with dlsym on it, while Mesa splits egl* (libEGL.dylib) from the
- * GL driver (libgallium-...dylib). Shipping the split pair gave
- * "Core OpenGL functions could not be found" in GL.createCapabilities().
+ * libEGL.dylib is a merged image that re-exports both Mesa's EGL entry points
+ * and the gallium driver. It has to be one image: LWJGL is handed this
+ * filename as org.lwjgl.opengl.libname and resolves every gl* symbol with
+ * dlsym on it, while Mesa splits egl* from the GL driver
+ * (libgallium-...dylib). The split pair gave "Core OpenGL functions could not
+ * be found" in GL.createCapabilities(), and resolving against an EGL-only
+ * image elsewhere produced a NULL function pointer.
+ *
+ * The name stays libEGL.dylib deliberately: existing profiles store the
+ * renderer as this literal file name, and the renderer picker keeps a
+ * previously chosen value even after the candidate list changes. A new file
+ * name would be silently ignored by those profiles.
+ *
  * It re-exports @rpath/libEGL.1.dylib and @rpath/libgallium-26.3.0-devel.dylib,
  * so both must ship in Frameworks/ alongside it. */
-#define RENDERER_NAME_KOPPER_ZINK "libEGLkopper.dylib"
+#define RENDERER_NAME_KOPPER_ZINK "libEGL.dylib"
 #define RENDERER_NAME_VULKAN "libMoltenVK.dylib"
 // LTW (Large Thin Wrapper) - OpenGL Core 3.3 → OpenGL ES 3 转译层
 // 复刻自官方 MojoLauncher/LTW 仓库，完美支持 Sodium + Iris 光影：
