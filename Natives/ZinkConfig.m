@@ -246,7 +246,11 @@ static AppleGPUGeneration _cachedGPUGeneration = AppleGPUGenerationUnknown;
 
 + (BOOL)isZinkRenderSelected {
     NSString *renderer = [PLProfiles resolveKeyForCurrentProfile:@"renderer"];
-    return [renderer hasPrefix:@"libOSMesa"];
+    // Kopper Zink (libEGL.dylib) is the same zink driver entered through EGL,
+    // so it is a zink renderer too and must get the same environment (GL
+    // version override, extension overrides, glthread, cache size).
+    return [renderer hasPrefix:@"libOSMesa"] ||
+           [renderer isEqualToString:@ RENDERER_NAME_KOPPER_ZINK];
 }
 
 #pragma mark - Environment Setup

@@ -1496,7 +1496,12 @@ int launchJVM(NSString *accountId, id launchTarget, int width, int height, int m
         // shader 等），仅禁用 MoltenVK 支持不佳的 Transform Feedback，不影响 Iris/OptiFine。
         // ★ [RENDERER-GAP] 排除 libOSMesaVirgl.dylib（virgl guest 同样命中 libOSMesa
         // 前缀，但它要 GALLIUM_DRIVER=virgl，不能被 ZinkConfig 覆盖）。
-        if ([renderer hasPrefix:@"libOSMesa"] && ![renderer isEqualToString:@ RENDERER_NAME_VIRGL]) {
+        // Kopper Zink (libEGL.dylib) is zink too, so it needs the same
+        // MESA_GL_VERSION_OVERRIDE / MESA_EXTENSION_OVERRIDE treatment.
+        // Without this the EGL path reported GL 4.1 while the OSMesa path
+        // reported 4.6, because only the libOSMesa prefix matched here.
+        if (([renderer hasPrefix:@"libOSMesa"] && ![renderer isEqualToString:@ RENDERER_NAME_VIRGL]) ||
+            [renderer isEqualToString:@ RENDERER_NAME_KOPPER_ZINK]) {
             [ZinkConfig applyZinkEnvironmentFromPreferences];
             NSString *configSummary = [ZinkConfig activeConfigSummary];
             NSLog(@"[ZinkConfig] ========== Zink Renderer Active (Mesa 25) ==========");
