@@ -397,12 +397,6 @@ static NSArray<NSDictionary *> *rendererCandidates(void) {
         @{@"key": @ RENDERER_NAME_VK_ZINK,
           @"name": localize(@"preference.title.renderer.debug.zink", nil),
           @"file": @ RENDERER_NAME_VK_ZINK},
-        // Kopper Zink：真 EGL 直显（对齐安卓 zink+kopper）。dylib 不存在时
-        // availableRendererCandidates() 会自动隐藏本项，不会留下坏选项。
-        @{@"key": @ RENDERER_NAME_KOPPER_ZINK,
-          @"name": localize(@"preference.title.renderer.debug.kopper_zink",
-                            @"Zink (Kopper)"),
-          @"file": @ RENDERER_NAME_KOPPER_ZINK},
         @{@"key": @ RENDERER_NAME_LTW,
           @"name": localize(@"preference.title.renderer.debug.ltw", nil),
           @"file": @ RENDERER_NAME_LTW},

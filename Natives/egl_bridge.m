@@ -323,20 +323,6 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
         NSLog(@"[egl_bridge] MobileGL renderer: backend=%s",
             getenv("MOBILEGL_BACKEND_TYPE") ?: "<unset>");
         set_gl_bridge_tbl();
-    } else if (isKopperZinkRenderer(renderer.UTF8String)) {
-        // Kopper Zink（libEGL.dylib）：真 EGL 直显路径，对齐安卓的 zink+kopper。
-        //
-        // 与 Vulkan Zink（libOSMesa.8.dylib 走 osm_bridge 离屏回读）相对：
-        // 这里由 Mesa 的 libEGL 从 CAMetalLayer 建 iOS 平台 display，
-        // kopper 把 swapchain 映像交给 zink 作渲染目标，eglSwapBuffers 直接
-        // present —— 没有 GPU→CPU 回读，也没有 CGImage 上传。
-        //
-        // 必须排在 libOSMesa 前缀分支之前（两者文件名不同，此处仍显式前置，
-        // 避免日后命名变化被前缀分支吞掉）。
-        setenv("GALLIUM_DRIVER", "zink", 1);
-        NSLog(@"[egl_bridge] Kopper Zink renderer: real EGL path via libEGL.dylib "
-              @"(EGL_PLATFORM_IOS_MESA -> zink kopper -> CAMetalLayer present)");
-        set_gl_bridge_tbl();
     } else if ([renderer hasPrefix:@"libOSMesa"] && !isVirglRenderer(renderer.UTF8String)) {
         // ★ [RENDERER-GAP] 排除 libOSMesaVirgl.dylib（VirGL 已在上面单独分支处理，
         // 其 GALLIUM_DRIVER=virgl 由 ame_gap_virgl_boot 设置，不能被 zink 覆盖）。
@@ -448,22 +434,6 @@ static int pojavInitOpenGLInternal(BOOL setLwjglProperty) {
                   @"(glslang symbols isolated from libshaderc.dylib)", renderer);
         }
         dlopen(rpath.UTF8String, dlFlags);
-
-        // Kopper Zink: load the gallium driver explicitly with RTLD_GLOBAL.
-        // The renderer image is a small re-export stub (LC_REEXPORT_DYLIB) that
-        // forwards both Mesa's EGL entry points and the GL driver; if dyld
-        // cannot resolve the libraries it points at, dlsym on it yields NULL
-        // and the first GL call jumps to 0x0. Loading the driver itself puts
-        // the gl* symbols into the global symbol table regardless, so LWJGL's
-        // lookup succeeds either way.
-        if (isKopperZinkRenderer(renderer.UTF8String)) {
-            void *driver = dlopen("@rpath/libgallium-26.3.0-devel.dylib",
-                                  RTLD_NOW | RTLD_GLOBAL);
-            NSLog(@"[egl_bridge] Kopper Zink: explicit driver preload -> %p%s",
-                  driver ?: NULL, driver == NULL ? " (FAILED)" : "");
-            if (driver == NULL)
-                NSLog(@"[egl_bridge] Kopper Zink driver dlopen error: %s", dlerror() ?: "?");
-        }
 
         // Diagnostic: a re-export stub (LC_REEXPORT_DYLIB) only yields symbols
         // when dyld resolved the libraries it points at. If it did not, dlsym
