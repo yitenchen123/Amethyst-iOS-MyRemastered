@@ -517,6 +517,7 @@ static bool ame_eglSurfacePixelSizeFromUIKit(int *outW, int *outH) {
 // 有了它，渲染线程再也不必为拿一个尺寸而去读 UIKit。
 // ame_rendererHandle 的实现在文件后部（约第 1400 行），此处提前声明以便本节使用。
 static void *ame_rendererHandle(void);
+static void *ame_driverHandle(void);
 
 // ame_glSymbolTrusted 的实现在文件后部（GL 入口点解析节）。本节在 460 行附近
 // 就要用它校验 EGL 符号镜像，缺少前向声明会被 clang 判为隐式函数声明
@@ -2516,6 +2517,40 @@ static void  *g_rendererHandle = NULL; // 渲染器 dylib 句柄（缓存，避�
 // 处）会写入它，两处直接共享同一个全局符号。
 char g_lwjglGLLibPath[1024] = {0};
 
+// Fallback handle for gl* symbols when the renderer image is a merged EGL
+// re-export (libEGL.dylib): its GL entry points live in the driver dylib, so
+// dlsym on the renderer handle alone returns NULL and Minecraft 26.3's
+// glGetError probe rejects the GL backend ("glGetError mismatch").
+//
+// RTLD_NOLOAD only queries an existing mapping - it neither reloads nor
+// changes visibility, so the deliberate RTLD_LOCAL isolation of the renderer
+// images is preserved.
+static void *ame_driverHandle(void) {
+    static void *cached = NULL;
+    static int tried = 0;
+    if (tried) return cached;
+    tried = 1;
+
+    /* The bundled driver is versioned (libgallium-<ver>.dylib); resolve it by
+     * asking the loader for each known spelling rather than hard-coding. */
+    const char *candidates[] = {
+        "@rpath/libgallium-26.3.0-devel.dylib",
+        "@rpath/libgallium_dri.dylib",
+        NULL,
+    };
+    for (unsigned i = 0; candidates[i] != NULL; i++) {
+        void *h = dlopen(candidates[i], RTLD_NOW | RTLD_NOLOAD);
+        if (h != NULL) {
+            cached = h;
+            NSDebugLog(@"[SDLHook] driver handle <- %s (NOLOAD)", candidates[i]);
+            return cached;
+        }
+    }
+    NSDebugLog(@"[SDLHook] driver handle: no libgallium mapping found "
+               @"(gl* symbols will stay unresolved in the merged EGL image)");
+    return NULL;
+}
+
 static void *ame_rendererHandle(void) {
     if (g_rendererHandle != NULL) return g_rendererHandle;
 
@@ -3164,13 +3199,20 @@ static void *ame_resolveGlEntry(void *handle, const char *name) {
 
     if (ame_glSymbolTrusted(def)) return NULL;   // 原路径可用，不接管
 
-    if (rh != NULL) {
-        void *p = dlsym(rh, name);
+    /* The renderer image may be a merged EGL re-export whose gl* symbols live
+     * in the driver dylib, so try both handles. Each candidate still has to
+     * pass ame_glSymbolTrusted(). */
+    void *handles[2] = { rh, ame_driverHandle() };
+    for (unsigned hi = 0; hi < 2; hi++) {
+        if (handles[hi] == NULL)
+            continue;
+        void *p = dlsym(handles[hi], name);
         if (ame_glSymbolTrusted(p)) {
             if (ame_glRedirectLogBudget > 0) {
                 ame_glRedirectLogBudget--;
                 NSDebugLog(@"[SDLHook] GL entry '%s': RTLD_DEFAULT stub rejected, "
-                            "using renderer impl %p", name, p);
+                            "using renderer impl %p (%s)", name, p,
+                            hi == 0 ? "renderer image" : "driver image");
             }
             // ★ [SHADER-CAP] 上报包装 / 别名映射（模块未启用或该入口无真实实现时返回 NULL）。
             ame_shaderCapEnsureSetup();
